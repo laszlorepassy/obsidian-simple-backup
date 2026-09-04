@@ -2,6 +2,8 @@
 
 A minimal Obsidian plugin with a single job: copy your entire vault to a folder of your choice, timestamped and versioned, without ever slowing down Obsidian.
 
+![Simple Backup settings, with a live progress notice showing a backup in progress](screenshot.png)
+
 ## Why
 
 Most sync/backup plugins are built around cloud services, conflict resolution, or partial sync. Simple Backup does none of that — it just makes a plain, timestamped copy of the vault on a schedule (or on demand), and prunes old copies according to a retention policy you control. If you already sync your vault another way and just want a local (or network-drive) safety net, this is it.
