@@ -1,0 +1,5 @@
+node_modules/
+data.json
+backup-errors.log
+.DS_Store
+Thumbs.db
