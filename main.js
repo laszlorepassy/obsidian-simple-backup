@@ -1,7 +1,7 @@
 'use strict';
 
 const { Plugin, PluginSettingTab, Setting, Notice } = require('obsidian');
-const { fork } = require('child_process');
+const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
@@ -51,9 +51,13 @@ function sleep(ms) {
 }
 
 function send(msg) {
-  if (process.connected && typeof process.send === 'function') {
-    try { process.send(msg); } catch (e) { /* the parent process may already be gone */ }
-  }
+  // Plain newline-delimited JSON on stdout instead of child_process's
+  // fork()-only IPC channel (process.send) -- a bare stdout pipe needs no
+  // special IPC bootstrap, so it works the same whether this script is run
+  // by real node or by Electron acting as node (ELECTRON_RUN_AS_NODE=1).
+  try {
+    process.stdout.write(JSON.stringify(msg) + '\\n');
+  } catch (e) { /* the parent process may already be gone */ }
 }
 
 const stats = { dirs: 0, files: 0, bytes: 0, skipped: 0, errors: [] };
@@ -471,8 +475,8 @@ class SimpleBackupPlugin extends Plugin {
 
     let child;
     try {
-      child = fork(workerPath, args, {
-        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      child = spawn(process.execPath, [workerPath, ...args], {
+        stdio: ['ignore', 'pipe', 'pipe'],
         detached: detached,
         windowsHide: true,
         // Obsidian's process.execPath points at the Electron binary; without this,
@@ -493,8 +497,15 @@ class SimpleBackupPlugin extends Plugin {
 
     let finished = false;
     let stderrBuf = '';
+    let stdoutBuf = '';
     if (child.stderr) child.stderr.on('data', (d) => { stderrBuf += d.toString(); });
-    if (child.stdout) child.stdout.on('data', () => { /* worker doesn't use stdout; drain it so it can't block */ });
+
+    const appendLog = (text) => {
+      try {
+        fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
+        fs.appendFileSync(logFilePath, `=== ${new Date().toISOString()} ===\n${text}\n\n`, 'utf8');
+      } catch (e) { /* best effort */ }
+    };
 
     let lastMessageAt = Date.now();
     const STALL_TIMEOUT_MS = 10 * 60 * 1000;
@@ -517,7 +528,7 @@ class SimpleBackupPlugin extends Plugin {
     };
 
     let lastUpdate = 0;
-    child.on('message', (msg) => {
+    const handleMessage = (msg) => {
       if (!msg || typeof msg !== 'object') return;
       lastMessageAt = Date.now();
 
@@ -552,33 +563,49 @@ class SimpleBackupPlugin extends Plugin {
 
       if (msg.type === 'error') {
         finishWithMessage('Backup error: ' + msg.message, 6000);
+        appendLog('Worker reported an error:\n' + msg.message);
       }
-    });
+    };
+
+    // The worker writes one JSON object per line on stdout instead of using
+    // child_process's fork()-only IPC channel (see backup-worker.js's send()).
+    if (child.stdout) {
+      child.stdout.on('data', (d) => {
+        stdoutBuf += d.toString();
+        let idx;
+        while ((idx = stdoutBuf.indexOf('\n')) !== -1) {
+          const line = stdoutBuf.slice(0, idx).trim();
+          stdoutBuf = stdoutBuf.slice(idx + 1);
+          if (!line) continue;
+          let msg;
+          try { msg = JSON.parse(line); } catch (e) { continue; }
+          handleMessage(msg);
+        }
+      });
+    }
 
     child.on('error', (err) => {
       finishWithMessage('Backup process error: ' + err.message, 6000);
+      appendLog('Failed to start the backup process: ' + err.message);
     });
 
     child.on('exit', (code, signal) => {
       if (finished) return;
-      // The worker never sent a 'done'/'error' message before exiting — an
+      // The worker never sent a 'done'/'error' message before exiting -- an
       // uncaught crash, or something killed it. Surface whatever it printed
       // to stderr instead of leaving the progress Notice stuck forever.
       const detail = stderrBuf.trim()
         ? stderrBuf.trim().split('\n')[0]
-        : signal ? `killed (${signal})` : `exit code ${code}`;
-      finishWithMessage(`Backup process ended unexpectedly: ${detail}`, 8000);
-      if (stderrBuf.trim()) {
-        console.error('Simple Backup: worker stderr:\n' + stderrBuf);
-        try {
-          fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
-          fs.appendFileSync(
-            logFilePath,
-            `=== ${new Date().toISOString()} ===\nWorker exited unexpectedly (code ${code}, signal ${signal}):\n${stderrBuf}\n\n`,
-            'utf8'
-          );
-        } catch (e) { /* best effort */ }
-      }
+        : signal ? `killed (signal ${signal})` : `exit code ${code}`;
+      finishWithMessage(`Backup process ended unexpectedly: ${detail}`, 10000);
+      console.error('Simple Backup: worker exited unexpectedly. code=' + code + ' signal=' + signal
+        + (stderrBuf ? '\nstderr:\n' + stderrBuf : '')
+        + (stdoutBuf ? '\nunparsed stdout:\n' + stdoutBuf : ''));
+      appendLog(
+        `Worker exited unexpectedly (code ${code}, signal ${signal}).\n`
+        + (stderrBuf ? 'stderr:\n' + stderrBuf + '\n' : 'stderr: (empty)\n')
+        + (stdoutBuf ? 'unparsed stdout:\n' + stdoutBuf : 'unparsed stdout: (empty)')
+      );
     });
   }
 
