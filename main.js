@@ -12,10 +12,10 @@ const COPY_TIMEOUT_MS = 60 * 1000;
 
 const DEFAULT_SETTINGS = {
   targetDir: '',
-  runOnStartup: false,
+  runOnStartup: true,
   runHourly: false,
-  runDaily: false,
-  dailyTime: '03:00',
+  runDaily: true,
+  dailyTime: '20:00',
   keepDaily: 7,
   keepWeekly: 4,
   keepMonthly: 6,
