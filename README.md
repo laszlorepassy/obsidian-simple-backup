@@ -19,7 +19,6 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 - **Manual trigger**: ribbon icon and a command palette entry ("Run backup now").
 - **Scheduled triggers** (each independently toggleable):
   - On Obsidian startup
-  - On Obsidian shutdown (best-effort — see "Known limitations")
   - Hourly
   - Daily, at a configurable time
 - **Live progress notice**: a small, single, continuously-updating notification shows roughly how far the current backup has gotten (files copied, size so far).
@@ -33,7 +32,6 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 |---|---|
 | Target directory | Absolute path of the folder where dated backup snapshots are created. Required. |
 | Run on startup | Trigger a backup automatically whenever Obsidian opens the vault. |
-| Run on shutdown | Best-effort: trigger a backup automatically whenever the plugin is unloaded (closing Obsidian, disabling the plugin, or switching vaults). Runs inside Obsidian itself, so it only finishes if Obsidian stays open long enough. |
 | Run hourly | Trigger a backup once per hour. |
 | Run daily | Trigger a backup once a day at a set `HH:MM` (local time). |
 | Keep daily / weekly / monthly | How many most-recent daily/weekly/monthly snapshots to retain. |
@@ -51,9 +49,7 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 
 ## Known limitations
 
-- **No separate OS process.** An earlier version of this plugin ran the copy in a spawned child process at a lowered OS scheduling priority. In practice, Obsidian's Electron build silently ignores the standard mechanism for turning its own executable into a plain Node process (`ELECTRON_RUN_AS_NODE`), so the spawned "child" never actually ran the worker script — it just exited immediately. Rather than depend on that, the backup now runs inside Obsidian's own process using fully asynchronous I/O, which keeps the UI responsive without needing a second process at all. The trade-off is that the copy no longer gets a lowered OS priority of its own — in practice this is a non-issue, since copying is I/O-bound, not CPU-bound.
-- **"Run on shutdown" is best-effort.** Since there's no separate process anymore, a shutdown-triggered backup can only finish if Obsidian's process stays alive long enough to complete the copy. For a large vault, prefer "Run on startup" or a scheduled time.
-- **The plugin can't tell "Obsidian is closing" apart from "this plugin was disabled" or "you switched vaults"** — Obsidian's API fires the same lifecycle hook for all three. "Run on shutdown" runs on all of them.
+- **No separate OS process.** An earlier version of this plugin ran the copy in a spawned child process at a lowered OS scheduling priority. In practice, Obsidian's Electron build silently ignores the standard mechanism for turning its own executable into a plain Node process (`ELECTRON_RUN_AS_NODE`), so the spawned "child" never actually ran the worker script — it just exited immediately. Rather than depend on that, the backup now runs inside Obsidian's own process using fully asynchronous I/O, which keeps the UI responsive without needing a second process at all. The trade-off is that the copy no longer gets a lowered OS priority of its own — in practice this is a non-issue, since copying is I/O-bound, not CPU-bound. It's also why there's no "run on shutdown" option: without a surviving separate process, a backup triggered on close could only ever be a best-effort race against Obsidian actually exiting, which isn't a promise worth making. Use "Run on startup" or a scheduled time instead.
 - **A backup interrupted mid-copy** (Obsidian closed before it finished, machine lost power, target drive disconnected) is left exactly as it is — it's never auto-deleted, but it's also excluded from the daily/weekly/monthly retention accounting, so it won't accidentally count as "the latest good snapshot" either. Clean it up manually if you find one (it has no `.backup-complete` marker file inside it).
 - **The target directory can't be the vault itself.** It can be a subfolder of the vault, or any other location — just not the vault's root path exactly.
 - **The "Browse…" folder picker** depends on Electron's `remote.dialog`, which isn't part of every Obsidian/Electron build. If it's unavailable, the button shows a notice and you can still type the path in by hand.

@@ -13,7 +13,6 @@ const COPY_TIMEOUT_MS = 60 * 1000;
 const DEFAULT_SETTINGS = {
   targetDir: '',
   runOnStartup: false,
-  runOnShutdown: false,
   runHourly: false,
   runDaily: false,
   dailyTime: '03:00',
@@ -328,14 +327,6 @@ class SimpleBackupPlugin extends Plugin {
     }, 60 * 1000));
   }
 
-  onunload() {
-    if (this.settings && this.settings.runOnShutdown) {
-      // Best-effort: this runs inside Obsidian's own process, so it only
-      // completes if Obsidian stays open long enough to finish copying.
-      this.runBackup({ trigger: 'shutdown' });
-    }
-  }
-
   checkDailySchedule() {
     if (!this.settings.runDaily) return;
     const now = new Date();
@@ -536,13 +527,6 @@ class SimpleBackupSettingTab extends PluginSettingTab {
       .addToggle((t) => t
         .setValue(this.plugin.settings.runOnStartup)
         .onChange(async (v) => { this.plugin.settings.runOnStartup = v; await this.plugin.saveSettings(); }));
-
-    new Setting(containerEl)
-      .setName('Run on shutdown')
-      .setDesc('Best-effort: try to run a backup whenever this plugin is unloaded (closing Obsidian, disabling the plugin, or switching vaults). It runs inside Obsidian itself, so it only completes if Obsidian stays open long enough to finish copying — for a large vault, prefer "Run on startup" or a scheduled time instead.')
-      .addToggle((t) => t
-        .setValue(this.plugin.settings.runOnShutdown)
-        .onChange(async (v) => { this.plugin.settings.runOnShutdown = v; await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
       .setName('Run hourly')
