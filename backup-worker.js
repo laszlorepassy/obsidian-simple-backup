@@ -2,8 +2,8 @@
 'use strict';
 
 /**
- * Külön (alacsony prioritású) folyamatban futó mentő script.
- * Argumentumok: <sourceDir> <targetRoot> <vaultName> <configJson> <logFilePath>
+ * Backup script that runs in a separate, low-priority process.
+ * Arguments: <sourceDir> <targetRoot> <vaultName> <configJson> <logFilePath>
  */
 
 const fs = require('fs');
@@ -13,7 +13,7 @@ const os = require('os');
 try {
   os.setPriority(os.constants.priority.PRIORITY_BELOW_NORMAL);
 } catch (e) {
-  // a platform nem támogatja, nem gond
+  // platform doesn't support it, not a problem
 }
 
 const [sourceDir, targetRoot, vaultName, configJson, logFilePath] = process.argv.slice(2);
@@ -43,7 +43,7 @@ function sleep(ms) {
 
 function send(msg) {
   if (process.connected && typeof process.send === 'function') {
-    try { process.send(msg); } catch (e) { /* a szülő folyamat már lehet, hogy nincs is */ }
+    try { process.send(msg); } catch (e) { /* the parent process may already be gone */ }
   }
 }
 
@@ -57,7 +57,7 @@ function copyFileWithRetry(src, dest, size) {
       try {
         const st = fs.statSync(src);
         fs.utimesSync(dest, st.atime, st.mtime);
-      } catch (e) { /* nem kritikus */ }
+      } catch (e) { /* not critical */ }
       stats.files++;
       stats.bytes += size;
       return;
@@ -107,7 +107,7 @@ function copyTree(srcDir, destDir) {
 
     if (entry.isFile()) {
       let size = 0;
-      try { size = fs.statSync(from).size; } catch (e) { /* mindegy */ }
+      try { size = fs.statSync(from).size; } catch (e) { /* doesn't matter */ }
       copyFileWithRetry(from, to, size);
       if (stats.files % 25 === 0) {
         send({ type: 'progress', files: stats.files, bytes: stats.bytes });
@@ -150,7 +150,7 @@ function applyRetention(prefix) {
   backups.sort((a, b) => b.date - a.date);
   if (backups.length === 0) return deleted;
 
-  // A most készült mentés mindig megmarad, függetlenül a megőrzési számláktól.
+  // The snapshot that was just created is always kept, regardless of the retention counts.
   const keep = new Set([backups[0].name]);
 
   function keepLatestPerGroup(keyFn, limit) {
@@ -186,24 +186,24 @@ function writeErrorLog(target) {
   if (!stats.errors.length) return;
   const lines = [];
   lines.push('=== ' + new Date().toISOString() + ' ===');
-  lines.push('Cél: ' + target);
+  lines.push('Target: ' + target);
   for (const e of stats.errors) lines.push('  - ' + e);
   lines.push('');
   try {
     fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
     fs.appendFileSync(logFilePath, lines.join('\n') + '\n', 'utf8');
-  } catch (e) { /* ha ez sem megy, nincs mit tenni */ }
+  } catch (e) { /* if even this fails, there's nothing more we can do */ }
 }
 
 function main() {
   if (!sourceDir || !targetRoot || !vaultName) {
-    send({ type: 'error', message: 'Hiányzó paraméterek a mentési folyamathoz.' });
+    send({ type: 'error', message: 'Missing parameters for the backup process.' });
     process.exitCode = 1;
     return;
   }
 
   if (!fs.existsSync(sourceDir)) {
-    send({ type: 'error', message: 'A forrás vault mappa nem található: ' + sourceDir });
+    send({ type: 'error', message: 'The source vault folder was not found: ' + sourceDir });
     process.exitCode = 1;
     return;
   }
@@ -211,7 +211,7 @@ function main() {
   try {
     fs.mkdirSync(targetRoot, { recursive: true });
   } catch (err) {
-    send({ type: 'error', message: 'A célkönyvtár nem hozható létre: ' + err.message });
+    send({ type: 'error', message: 'The target directory could not be created: ' + err.message });
     process.exitCode = 1;
     return;
   }
@@ -220,7 +220,7 @@ function main() {
   const target = path.join(targetRoot, prefix + stamp());
 
   if (fs.existsSync(target)) {
-    send({ type: 'error', message: 'A célmappa már létezik: ' + target });
+    send({ type: 'error', message: 'The target folder already exists: ' + target });
     process.exitCode = 1;
     return;
   }
