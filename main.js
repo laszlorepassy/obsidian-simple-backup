@@ -37,13 +37,13 @@ class SimpleBackupPlugin extends Plugin {
     this.isRunning = false;
     this.activeNotice = null;
 
-    this.addRibbonIcon('archive', 'Vault mentése most', () => {
+    this.addRibbonIcon('archive', 'Back up vault now', () => {
       this.runBackup({ trigger: 'manual' });
     });
 
     this.addCommand({
       id: 'run-backup-now',
-      name: 'Mentés indítása most',
+      name: 'Run backup now',
       callback: () => this.runBackup({ trigger: 'manual' }),
     });
 
@@ -113,46 +113,46 @@ class SimpleBackupPlugin extends Plugin {
     }
 
     if (!remote || !remote.dialog) {
-      new Notice('A fájlválasztó nem érhető el ezen az Obsidian/Electron verzión — add meg kézzel az elérési utat.');
+      new Notice('The folder picker is not available on this Obsidian/Electron version — enter the path manually.');
       return null;
     }
 
     try {
       const result = await remote.dialog.showOpenDialog({
         properties: ['openDirectory', 'createDirectory'],
-        title: 'Mentések célkönyvtára',
+        title: 'Backup target directory',
         defaultPath: this.settings.targetDir || undefined,
       });
       if (result.canceled || !result.filePaths || result.filePaths.length === 0) return null;
       return result.filePaths[0];
     } catch (err) {
-      new Notice('Hiba a fájlválasztó megnyitásakor: ' + (err && err.message ? err.message : String(err)));
+      new Notice('Error opening the folder picker: ' + (err && err.message ? err.message : String(err)));
       return null;
     }
   }
 
   runBackup({ trigger, detached = false } = {}) {
     if (this.isRunning) {
-      new Notice('Mentés már folyamatban van.');
+      new Notice('A backup is already in progress.');
       return;
     }
 
     const basePath = this.getVaultBasePath();
     if (!basePath) {
-      new Notice('Hiba: nem sikerült meghatározni a vault elérési útját (csak asztali Obsidianban működik).');
+      new Notice('Error: could not determine the vault path (this plugin only works in desktop Obsidian).');
       return;
     }
 
     const targetDir = (this.settings.targetDir || '').trim();
     if (!targetDir) {
-      new Notice('Hiba: nincs beállítva mentési célkönyvtár. Nyisd meg a beállításokat.');
+      new Notice('Error: no backup target directory set. Open the plugin settings.');
       return;
     }
 
     const pluginDir = this.getPluginDir();
     const workerPath = path.join(pluginDir, 'backup-worker.js');
     if (!fs.existsSync(workerPath)) {
-      new Notice('Hiba: a backup-worker.js nem található a plugin mappájában.');
+      new Notice('Error: backup-worker.js not found in the plugin folder.');
       return;
     }
 
@@ -169,7 +169,7 @@ class SimpleBackupPlugin extends Plugin {
     const args = [basePath, targetDir, vaultName, JSON.stringify(config), logFilePath];
 
     this.isRunning = true;
-    this.activeNotice = new Notice('Mentés indul...', 0);
+    this.activeNotice = new Notice('Backup starting...', 0);
 
     let child;
     try {
@@ -181,7 +181,7 @@ class SimpleBackupPlugin extends Plugin {
     } catch (err) {
       this.isRunning = false;
       if (this.activeNotice) this.activeNotice.hide();
-      new Notice('Hiba a mentés indításakor: ' + err.message);
+      new Notice('Error starting the backup: ' + err.message);
       return;
     }
 
@@ -197,7 +197,7 @@ class SimpleBackupPlugin extends Plugin {
         const now = Date.now();
         if (now - lastUpdate > 400 && this.activeNotice) {
           lastUpdate = now;
-          this.activeNotice.setMessage(`Mentés: ${msg.files} fájl, ${humanSize(msg.bytes)}`);
+          this.activeNotice.setMessage(`Backing up: ${msg.files} files, ${humanSize(msg.bytes)}`);
         }
         return;
       }
@@ -208,8 +208,8 @@ class SimpleBackupPlugin extends Plugin {
           const notice = this.activeNotice;
           notice.setMessage(
             msg.errors && msg.errors.length
-              ? `Mentés kész, hibákkal (${msg.errors.length}). Napló: backup-errors.log`
-              : `Mentés kész: ${msg.files} fájl, ${humanSize(msg.bytes)}`
+              ? `Backup finished with errors (${msg.errors.length}). See backup-errors.log`
+              : `Backup finished: ${msg.files} files, ${humanSize(msg.bytes)}`
           );
           setTimeout(() => notice.hide(), 4000);
           this.activeNotice = null;
@@ -230,7 +230,7 @@ class SimpleBackupPlugin extends Plugin {
         this.isRunning = false;
         if (this.activeNotice) {
           const notice = this.activeNotice;
-          notice.setMessage('Mentési hiba: ' + msg.message);
+          notice.setMessage('Backup error: ' + msg.message);
           setTimeout(() => notice.hide(), 6000);
           this.activeNotice = null;
         }
@@ -241,7 +241,7 @@ class SimpleBackupPlugin extends Plugin {
       this.isRunning = false;
       if (this.activeNotice) {
         const notice = this.activeNotice;
-        notice.setMessage('Mentési folyamat hiba: ' + err.message);
+        notice.setMessage('Backup process error: ' + err.message);
         setTimeout(() => notice.hide(), 6000);
         this.activeNotice = null;
       }
@@ -271,14 +271,14 @@ class SimpleBackupSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl('h2', { text: 'Simple Backup beállítások' });
+    containerEl.createEl('h2', { text: 'Simple Backup settings' });
 
     new Setting(containerEl)
-      .setName('Cél könyvtár')
-      .setDesc('A mappa, ahová a mentések kerülnek (teljes elérési út).')
+      .setName('Target directory')
+      .setDesc('The folder where backups are created (full path).')
       .addText((text) => {
         text
-          .setPlaceholder('pl. D:\\Backups\\Obsidian')
+          .setPlaceholder('e.g. D:\\Backups\\Obsidian')
           .setValue(this.plugin.settings.targetDir)
           .onChange(async (value) => {
             this.plugin.settings.targetDir = value.trim();
@@ -287,7 +287,7 @@ class SimpleBackupSettingTab extends PluginSettingTab {
         text.inputEl.style.width = '100%';
       })
       .addButton((btn) => btn
-        .setButtonText('Tallózás…')
+        .setButtonText('Browse…')
         .onClick(async () => {
           const dir = await this.plugin.pickDirectory();
           if (dir) {
@@ -298,29 +298,29 @@ class SimpleBackupSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName('Mentés indításkor')
-      .setDesc('Obsidian indulásakor automatikusan fusson a mentés.')
+      .setName('Run on startup')
+      .setDesc('Automatically run a backup when Obsidian opens this vault.')
       .addToggle((t) => t
         .setValue(this.plugin.settings.runOnStartup)
         .onChange(async (v) => { this.plugin.settings.runOnStartup = v; await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
-      .setName('Mentés leállításkor')
-      .setDesc('Obsidian bezárásakor automatikusan induljon a mentés (a háttérfolyamat bezárás után is folytatódik).')
+      .setName('Run on shutdown')
+      .setDesc('Automatically run a backup when Obsidian closes (the background process keeps running after Obsidian exits).')
       .addToggle((t) => t
         .setValue(this.plugin.settings.runOnShutdown)
         .onChange(async (v) => { this.plugin.settings.runOnShutdown = v; await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
-      .setName('Óránkénti mentés')
-      .setDesc('Óránként automatikusan fusson a mentés.')
+      .setName('Run hourly')
+      .setDesc('Automatically run a backup once per hour.')
       .addToggle((t) => t
         .setValue(this.plugin.settings.runHourly)
         .onChange(async (v) => { this.plugin.settings.runHourly = v; await this.plugin.saveSettings(); }));
 
     new Setting(containerEl)
-      .setName('Napi mentés')
-      .setDesc('Naponta egyszer, a megadott időpontban fusson a mentés (ÓÓ:PP, helyi idő).')
+      .setName('Run daily')
+      .setDesc('Run a backup once a day at the given time (HH:MM, local time).')
       .addToggle((t) => t
         .setValue(this.plugin.settings.runDaily)
         .onChange(async (v) => { this.plugin.settings.runDaily = v; await this.plugin.saveSettings(); }))
@@ -335,15 +335,15 @@ class SimpleBackupSettingTab extends PluginSettingTab {
           }
         }));
 
-    containerEl.createEl('h3', { text: 'Megőrzési szabályok' });
+    containerEl.createEl('h3', { text: 'Retention policy' });
     containerEl.createEl('p', {
-      text: 'Minden mentés végén a plugin ellenőrzi a meglévő mentések számát, és törli a felesleges régieket. A legutóbb készült mentés mindig megmarad.',
+      text: 'At the end of every backup, the plugin checks the number of existing backups and deletes the ones that are no longer needed. The snapshot that was just created is always kept.',
       cls: 'setting-item-description',
     });
 
     new Setting(containerEl)
-      .setName('Napi mentések megőrzése')
-      .setDesc('Az utolsó N napból egy-egy mentés maradjon meg.')
+      .setName('Keep daily backups')
+      .setDesc('Keep one backup for each of the last N days.')
       .addText((text) => text
         .setValue(String(this.plugin.settings.keepDaily))
         .onChange(async (v) => {
@@ -353,8 +353,8 @@ class SimpleBackupSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName('Heti mentések megőrzése')
-      .setDesc('Az utolsó N hétből egy-egy mentés maradjon meg.')
+      .setName('Keep weekly backups')
+      .setDesc('Keep one backup for each of the last N weeks.')
       .addText((text) => text
         .setValue(String(this.plugin.settings.keepWeekly))
         .onChange(async (v) => {
@@ -364,8 +364,8 @@ class SimpleBackupSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName('Havi mentések megőrzése')
-      .setDesc('Az utolsó N hónapból egy-egy mentés maradjon meg.')
+      .setName('Keep monthly backups')
+      .setDesc('Keep one backup for each of the last N months.')
       .addText((text) => text
         .setValue(String(this.plugin.settings.keepMonthly))
         .onChange(async (v) => {
@@ -374,10 +374,10 @@ class SimpleBackupSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    containerEl.createEl('h3', { text: 'Kihagyott elemek' });
+    containerEl.createEl('h3', { text: 'Excluded items' });
     new Setting(containerEl)
-      .setName('Kihagyott fájlok/mappák')
-      .setDesc('Vesszővel elválasztott lista (pl. node_modules, .git, .trash).')
+      .setName('Excluded files/folders')
+      .setDesc('Comma-separated list (e.g. node_modules, .git, .trash).')
       .addTextArea((ta) => ta
         .setValue(this.plugin.settings.excludeList.join(', '))
         .onChange(async (v) => {
@@ -385,22 +385,22 @@ class SimpleBackupSettingTab extends PluginSettingTab {
           await this.plugin.saveSettings();
         }));
 
-    containerEl.createEl('h3', { text: 'Kézi mentés' });
+    containerEl.createEl('h3', { text: 'Manual backup' });
     new Setting(containerEl)
-      .setName('Mentés indítása most')
+      .setName('Run backup now')
       .addButton((btn) => btn
-        .setButtonText('Mentés indítása')
+        .setButtonText('Run backup')
         .setCta()
         .onClick(() => this.plugin.runBackup({ trigger: 'manual' })));
 
     if (this.plugin.settings.lastRun) {
       const lr = this.plugin.settings.lastRun;
       const when = new Date(lr.time).toLocaleString();
-      const parts = [`${lr.files} fájl`];
-      parts.push(lr.errors ? `${lr.errors} hiba` : 'hiba nélkül');
-      if (lr.deleted) parts.push(`${lr.deleted} régi mentés törölve`);
+      const parts = [`${lr.files} files`];
+      parts.push(lr.errors ? `${lr.errors} errors` : 'no errors');
+      if (lr.deleted) parts.push(`${lr.deleted} old backups deleted`);
       containerEl.createEl('p', {
-        text: `Utolsó mentés (${lr.trigger}): ${when} — ${parts.join(', ')}`,
+        text: `Last backup (${lr.trigger}): ${when} — ${parts.join(', ')}`,
         cls: 'setting-item-description',
       });
     }
