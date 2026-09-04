@@ -335,15 +335,15 @@ class SimpleBackupSettingTab extends PluginSettingTab {
           }
         }));
 
-    containerEl.createEl('h3', { text: 'Retention policy' });
+    containerEl.createEl('h3', { text: 'Retention policy (auto-delete old backups)' });
     containerEl.createEl('p', {
-      text: 'At the end of every backup, the plugin checks the number of existing backups and deletes the ones that are no longer needed. The snapshot that was just created is always kept.',
+      text: 'After every backup, old snapshots are pruned automatically using the three rules below. Each rule keeps its own snapshots (e.g. "1 per day" and "1 per week" can both point at the same or different snapshots), and a snapshot is deleted only if none of the three rules want it anymore. The snapshot just created by this run is never deleted, even if all three numbers are set to 0.',
       cls: 'setting-item-description',
     });
 
     new Setting(containerEl)
-      .setName('Keep daily backups')
-      .setDesc('Keep one backup for each of the last N days.')
+      .setName('Daily snapshots to keep')
+      .setDesc('Keeps 1 snapshot (the most recent that day) for each of the last N calendar days. Example: 7 = never lose more than a day of work, going back a week.')
       .addText((text) => text
         .setValue(String(this.plugin.settings.keepDaily))
         .onChange(async (v) => {
@@ -353,8 +353,8 @@ class SimpleBackupSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName('Keep weekly backups')
-      .setDesc('Keep one backup for each of the last N weeks.')
+      .setName('Weekly snapshots to keep')
+      .setDesc('Keeps 1 snapshot (the most recent that week) for each of the last N calendar weeks. Example: 4 = one checkpoint per week, for the last month.')
       .addText((text) => text
         .setValue(String(this.plugin.settings.keepWeekly))
         .onChange(async (v) => {
@@ -364,8 +364,8 @@ class SimpleBackupSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName('Keep monthly backups')
-      .setDesc('Keep one backup for each of the last N months.')
+      .setName('Monthly snapshots to keep')
+      .setDesc('Keeps 1 snapshot (the most recent that month) for each of the last N calendar months. Example: 6 = one checkpoint per month, for the last half year.')
       .addText((text) => text
         .setValue(String(this.plugin.settings.keepMonthly))
         .onChange(async (v) => {
