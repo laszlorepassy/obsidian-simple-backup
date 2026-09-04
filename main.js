@@ -197,7 +197,8 @@ class SimpleBackupPlugin extends Plugin {
         const now = Date.now();
         if (now - lastUpdate > 400 && this.activeNotice) {
           lastUpdate = now;
-          this.activeNotice.setMessage(`Backing up: ${msg.files} files, ${humanSize(msg.bytes)}`);
+          const fileLabel = msg.total ? `${msg.files}/${msg.total} files` : `${msg.files} files`;
+          this.activeNotice.setMessage(`Backing up: ${fileLabel}, ${humanSize(msg.bytes)}`);
         }
         return;
       }

@@ -49,6 +49,32 @@ function send(msg) {
 
 const stats = { dirs: 0, files: 0, bytes: 0, skipped: 0, errors: [] };
 const targetRootResolved = targetRoot ? path.resolve(targetRoot) : null;
+let totalFiles = 0;
+
+function countFiles(srcDir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(srcDir, { withFileTypes: true });
+  } catch (err) {
+    return 0;
+  }
+
+  let count = 0;
+  for (const entry of entries) {
+    if (EXCLUDE.has(entry.name)) continue;
+
+    const from = path.join(srcDir, entry.name);
+    if (targetRootResolved && path.resolve(from) === targetRootResolved) continue;
+    if (entry.isSymbolicLink()) continue;
+
+    if (entry.isDirectory()) {
+      count += countFiles(from);
+    } else if (entry.isFile()) {
+      count++;
+    }
+  }
+  return count;
+}
 
 function copyFileWithRetry(src, dest, size) {
   for (let attempt = 1; ; attempt++) {
@@ -110,7 +136,7 @@ function copyTree(srcDir, destDir) {
       try { size = fs.statSync(from).size; } catch (e) { /* doesn't matter */ }
       copyFileWithRetry(from, to, size);
       if (stats.files % 25 === 0) {
-        send({ type: 'progress', files: stats.files, bytes: stats.bytes });
+        send({ type: 'progress', files: stats.files, total: totalFiles, bytes: stats.bytes });
       }
     }
   }
@@ -224,6 +250,9 @@ function main() {
     process.exitCode = 1;
     return;
   }
+
+  totalFiles = countFiles(sourceDir);
+  send({ type: 'progress', files: 0, total: totalFiles, bytes: 0 });
 
   copyTree(sourceDir, target);
   const deleted = applyRetention(prefix);
