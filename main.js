@@ -36,6 +36,7 @@ const KEEP_MONTHLY = Number.isFinite(config.keepMonthly) ? config.keepMonthly : 
 
 const RETRIES = 3;
 const RETRY_WAIT_MS = 800;
+const COMPLETE_MARKER = '.backup-complete';
 
 function pad(n) { return String(n).padStart(2, '0'); }
 
@@ -143,9 +144,7 @@ function copyTree(srcDir, destDir) {
       let size = 0;
       try { size = fs.statSync(from).size; } catch (e) { /* doesn't matter */ }
       copyFileWithRetry(from, to, size);
-      if (stats.files % 25 === 0) {
-        send({ type: 'progress', files: stats.files, total: totalFiles, bytes: stats.bytes });
-      }
+      send({ type: 'progress', files: stats.files, total: totalFiles, bytes: stats.bytes });
     }
   }
 }
@@ -179,7 +178,12 @@ function applyRetention(prefix) {
   const backups = entries
     .filter((e) => e.isDirectory() && e.name.startsWith(prefix))
     .map((e) => ({ name: e.name, date: parseBackupDate(e.name, prefix) }))
-    .filter((b) => b.date instanceof Date && !isNaN(b.date));
+    .filter((b) => b.date instanceof Date && !isNaN(b.date))
+    // Only manage backups that finished copying. A folder from a run that
+    // crashed or was killed mid-copy has no marker and is left untouched,
+    // so it never gets mistaken for "the latest good snapshot" and never
+    // displaces a genuinely complete older backup.
+    .filter((b) => fs.existsSync(path.join(targetRoot, b.name, COMPLETE_MARKER)));
 
   backups.sort((a, b) => b.date - a.date);
   if (backups.length === 0) return deleted;
@@ -263,6 +267,13 @@ function main() {
   send({ type: 'progress', files: 0, total: totalFiles, bytes: 0 });
 
   copyTree(sourceDir, target);
+
+  try {
+    fs.writeFileSync(path.join(target, COMPLETE_MARKER), new Date().toISOString(), 'utf8');
+  } catch (err) {
+    stats.errors.push(target + '  ->  could not write completion marker: ' + err.message);
+  }
+
   const deleted = applyRetention(prefix);
   writeErrorLog(target);
 
@@ -428,6 +439,11 @@ class SimpleBackupPlugin extends Plugin {
       return;
     }
 
+    if (path.resolve(targetDir) === path.resolve(basePath)) {
+      new Notice('Error: the target directory cannot be the vault itself — pick (or create) a subfolder or a separate location.');
+      return;
+    }
+
     const pluginDir = this.getPluginDir();
     const workerPath = path.join(pluginDir, 'backup-worker.js');
     try {
@@ -456,7 +472,7 @@ class SimpleBackupPlugin extends Plugin {
     let child;
     try {
       child = fork(workerPath, args, {
-        stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
         detached: detached,
         windowsHide: true,
         // Obsidian's process.execPath points at the Electron binary; without this,
@@ -475,9 +491,35 @@ class SimpleBackupPlugin extends Plugin {
       child.unref();
     }
 
+    let finished = false;
+    let stderrBuf = '';
+    if (child.stderr) child.stderr.on('data', (d) => { stderrBuf += d.toString(); });
+    if (child.stdout) child.stdout.on('data', () => { /* worker doesn't use stdout; drain it so it can't block */ });
+
+    let lastMessageAt = Date.now();
+    const STALL_TIMEOUT_MS = 10 * 60 * 1000;
+    const watchdog = this.registerInterval(window.setInterval(() => {
+      if (!finished && Date.now() - lastMessageAt > STALL_TIMEOUT_MS) {
+        try { child.kill(); } catch (e) { /* already gone */ }
+      }
+    }, 30 * 1000));
+
+    const finishWithMessage = (text, timeoutMs) => {
+      finished = true;
+      window.clearInterval(watchdog);
+      this.isRunning = false;
+      if (this.activeNotice) {
+        const notice = this.activeNotice;
+        notice.setMessage(text);
+        setTimeout(() => notice.hide(), timeoutMs);
+        this.activeNotice = null;
+      }
+    };
+
     let lastUpdate = 0;
     child.on('message', (msg) => {
       if (!msg || typeof msg !== 'object') return;
+      lastMessageAt = Date.now();
 
       if (msg.type === 'progress') {
         const now = Date.now();
@@ -490,17 +532,12 @@ class SimpleBackupPlugin extends Plugin {
       }
 
       if (msg.type === 'done') {
-        this.isRunning = false;
-        if (this.activeNotice) {
-          const notice = this.activeNotice;
-          notice.setMessage(
-            msg.errors && msg.errors.length
-              ? `Backup finished with errors (${msg.errors.length}). See backup-errors.log`
-              : `Backup finished: ${msg.files} files, ${humanSize(msg.bytes)}`
-          );
-          setTimeout(() => notice.hide(), 4000);
-          this.activeNotice = null;
-        }
+        finishWithMessage(
+          msg.errors && msg.errors.length
+            ? `Backup finished with errors (${msg.errors.length}). See backup-errors.log`
+            : `Backup finished: ${msg.files} files, ${humanSize(msg.bytes)}`,
+          4000
+        );
         this.settings.lastRun = {
           time: Date.now(),
           trigger,
@@ -514,28 +551,34 @@ class SimpleBackupPlugin extends Plugin {
       }
 
       if (msg.type === 'error') {
-        this.isRunning = false;
-        if (this.activeNotice) {
-          const notice = this.activeNotice;
-          notice.setMessage('Backup error: ' + msg.message);
-          setTimeout(() => notice.hide(), 6000);
-          this.activeNotice = null;
-        }
+        finishWithMessage('Backup error: ' + msg.message, 6000);
       }
     });
 
     child.on('error', (err) => {
-      this.isRunning = false;
-      if (this.activeNotice) {
-        const notice = this.activeNotice;
-        notice.setMessage('Backup process error: ' + err.message);
-        setTimeout(() => notice.hide(), 6000);
-        this.activeNotice = null;
-      }
+      finishWithMessage('Backup process error: ' + err.message, 6000);
     });
 
-    child.on('exit', () => {
-      this.isRunning = false;
+    child.on('exit', (code, signal) => {
+      if (finished) return;
+      // The worker never sent a 'done'/'error' message before exiting — an
+      // uncaught crash, or something killed it. Surface whatever it printed
+      // to stderr instead of leaving the progress Notice stuck forever.
+      const detail = stderrBuf.trim()
+        ? stderrBuf.trim().split('\n')[0]
+        : signal ? `killed (${signal})` : `exit code ${code}`;
+      finishWithMessage(`Backup process ended unexpectedly: ${detail}`, 8000);
+      if (stderrBuf.trim()) {
+        console.error('Simple Backup: worker stderr:\n' + stderrBuf);
+        try {
+          fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
+          fs.appendFileSync(
+            logFilePath,
+            `=== ${new Date().toISOString()} ===\nWorker exited unexpectedly (code ${code}, signal ${signal}):\n${stderrBuf}\n\n`,
+            'utf8'
+          );
+        } catch (e) { /* best effort */ }
+      }
     });
   }
 
@@ -593,7 +636,7 @@ class SimpleBackupSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Run on shutdown')
-      .setDesc('Automatically run a backup when Obsidian closes (the background process keeps running after Obsidian exits).')
+      .setDesc('Automatically run a backup whenever this plugin is unloaded — closing Obsidian, but also disabling this plugin or switching to another vault (the background process keeps running after Obsidian exits).')
       .addToggle((t) => t
         .setValue(this.plugin.settings.runOnShutdown)
         .onChange(async (v) => { this.plugin.settings.runOnShutdown = v; await this.plugin.saveSettings(); }));
