@@ -43,9 +43,13 @@ function sleep(ms) {
 }
 
 function send(msg) {
-  if (process.connected && typeof process.send === 'function') {
-    try { process.send(msg); } catch (e) { /* the parent process may already be gone */ }
-  }
+  // Plain newline-delimited JSON on stdout instead of child_process's
+  // fork()-only IPC channel (process.send) -- a bare stdout pipe needs no
+  // special IPC bootstrap, so it works the same whether this script is run
+  // by real node or by Electron acting as node (ELECTRON_RUN_AS_NODE=1).
+  try {
+    process.stdout.write(JSON.stringify(msg) + '\n');
+  } catch (e) { /* the parent process may already be gone */ }
 }
 
 const stats = { dirs: 0, files: 0, bytes: 0, skipped: 0, errors: [] };
