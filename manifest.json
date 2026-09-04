@@ -3,7 +3,7 @@
   "name": "Simple Backup",
   "version": "1.0.0",
   "minAppVersion": "1.4.0",
-  "description": "Backs up the vault to a folder of your choice, versioned by date and time, in a low-priority background process, with automatic daily/weekly/monthly retention.",
+  "description": "Backs up the vault to a folder of your choice, versioned by date and time, in the background without blocking the interface, with automatic daily/weekly/monthly retention.",
   "author": "Laszlo Repassy",
   "authorUrl": "",
   "isDesktopOnly": true

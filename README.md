@@ -8,7 +8,7 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 
 ## How it works
 
-- On each run, Simple Backup spawns a **separate, low-priority background process** (a forked Node.js child process, `os.setPriority(PRIORITY_BELOW_NORMAL)`) that does the actual file copying. Obsidian's UI thread is never blocked, and disk I/O competes as little as possible with your normal usage.
+- On each run, Simple Backup copies the vault using fully asynchronous file operations (Node's `fs.promises`), so the actual disk I/O runs on a background thread pool instead of Obsidian's UI thread — the interface never freezes or stutters during a backup, even a large one.
 - The vault is copied into `<target>/<vault-name>-<YYYY-MM-DD-HHmm>/`.
 - Common junk/VCS folders (`node_modules`, `.git`, `.trash`, OS metadata files, etc.) are excluded by default and configurable.
 - After every backup, a **retention policy** (keep N daily / N weekly / N monthly snapshots) prunes old backups automatically. The snapshot that was just created is always kept.
@@ -19,7 +19,7 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 - **Manual trigger**: ribbon icon and a command palette entry ("Run backup now").
 - **Scheduled triggers** (each independently toggleable):
   - On Obsidian startup
-  - On Obsidian shutdown (the backup process is detached and keeps running even after Obsidian has fully closed)
+  - On Obsidian shutdown (best-effort — see "Known limitations")
   - Hourly
   - Daily, at a configurable time
 - **Live progress notice**: a small, single, continuously-updating notification shows roughly how far the current backup has gotten (files copied, size so far).
@@ -33,7 +33,7 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 |---|---|
 | Target directory | Absolute path of the folder where dated backup snapshots are created. Required. |
 | Run on startup | Trigger a backup automatically whenever Obsidian opens the vault. |
-| Run on shutdown | Trigger a backup automatically whenever the plugin is unloaded (closing Obsidian, disabling the plugin, or switching vaults); the copy continues in the background after Obsidian exits. |
+| Run on shutdown | Best-effort: trigger a backup automatically whenever the plugin is unloaded (closing Obsidian, disabling the plugin, or switching vaults). Runs inside Obsidian itself, so it only finishes if Obsidian stays open long enough. |
 | Run hourly | Trigger a backup once per hour. |
 | Run daily | Trigger a backup once a day at a set `HH:MM` (local time). |
 | Keep daily / weekly / monthly | How many most-recent daily/weekly/monthly snapshots to retain. |
@@ -41,7 +41,7 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 
 ## Requirements
 
-- Desktop only (Windows/macOS/Linux). The plugin relies on Node.js's `child_process`/`fs`/`os` modules and Electron's native dialog, none of which are available in Obsidian Mobile — the plugin is marked `isDesktopOnly` and won't load on iOS/Android.
+- Desktop only (Windows/macOS/Linux). The plugin relies on Node.js's `fs` module and (optionally) Electron's native dialog, neither of which is available in Obsidian Mobile — the plugin is marked `isDesktopOnly` and won't load on iOS/Android.
 
 ## Installation (manual)
 
@@ -51,16 +51,16 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 
 ## Known limitations
 
+- **No separate OS process.** An earlier version of this plugin ran the copy in a spawned child process at a lowered OS scheduling priority. In practice, Obsidian's Electron build silently ignores the standard mechanism for turning its own executable into a plain Node process (`ELECTRON_RUN_AS_NODE`), so the spawned "child" never actually ran the worker script — it just exited immediately. Rather than depend on that, the backup now runs inside Obsidian's own process using fully asynchronous I/O, which keeps the UI responsive without needing a second process at all. The trade-off is that the copy no longer gets a lowered OS priority of its own — in practice this is a non-issue, since copying is I/O-bound, not CPU-bound.
+- **"Run on shutdown" is best-effort.** Since there's no separate process anymore, a shutdown-triggered backup can only finish if Obsidian's process stays alive long enough to complete the copy. For a large vault, prefer "Run on startup" or a scheduled time.
 - **The plugin can't tell "Obsidian is closing" apart from "this plugin was disabled" or "you switched vaults"** — Obsidian's API fires the same lifecycle hook for all three. "Run on shutdown" runs on all of them.
-- **A backup interrupted mid-copy** (Obsidian force-quit, machine lost power, target drive disconnected) is left exactly as it is — it's never auto-deleted, but it's also excluded from the daily/weekly/monthly retention accounting, so it won't accidentally count as "the latest good snapshot" either. Clean it up manually if you find one (it has no `.backup-complete` marker file inside it).
+- **A backup interrupted mid-copy** (Obsidian closed before it finished, machine lost power, target drive disconnected) is left exactly as it is — it's never auto-deleted, but it's also excluded from the daily/weekly/monthly retention accounting, so it won't accidentally count as "the latest good snapshot" either. Clean it up manually if you find one (it has no `.backup-complete` marker file inside it).
 - **The target directory can't be the vault itself.** It can be a subfolder of the vault, or any other location — just not the vault's root path exactly.
 - **The "Browse…" folder picker** depends on Electron's `remote.dialog`, which isn't part of every Obsidian/Electron build. If it's unavailable, the button shows a notice and you can still type the path in by hand.
 
 ## Project layout
 
-- `main.js` — the whole plugin: settings UI, scheduling, ribbon icon/command, and orchestration of the background process. It embeds the full source of `backup-worker.js` as a string and writes it out to the plugin folder itself before every run (Obsidian's installer only ever downloads `manifest.json`/`main.js`/`styles.css` from a release, so a second top-level file would never reach anyone who installs from the community plugin browser).
-- `backup-worker.js` — the readable, independently-testable source of that worker: the standalone Node.js script that actually copies files, writes the completion marker, and applies the retention policy, run as a separate low-priority child process so it never competes with Obsidian's own work.
-- `sync-worker.js` — run `node sync-worker.js` after editing `backup-worker.js` to re-embed it into `main.js`.
+- `main.js` — the entire plugin: settings UI, scheduling, ribbon icon/command, and the `BackupRun` class that does the actual asynchronous copying and retention.
 - `manifest.json` — standard Obsidian plugin manifest.
 
 ## License
