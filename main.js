@@ -459,6 +459,10 @@ class SimpleBackupPlugin extends Plugin {
         stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
         detached: detached,
         windowsHide: true,
+        // Obsidian's process.execPath points at the Electron binary; without this,
+        // Electron would try to launch a whole new app window instead of running
+        // this script as plain Node.
+        env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' }),
       });
     } catch (err) {
       this.isRunning = false;
