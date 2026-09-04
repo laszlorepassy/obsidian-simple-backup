@@ -1,303 +1,14 @@
 'use strict';
 
 const { Plugin, PluginSettingTab, Setting, Notice } = require('obsidian');
-const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
-
-// WORKER_SOURCE_START
-const WORKER_SOURCE = `#!/usr/bin/env node
-'use strict';
-
-/**
- * Backup script that runs in a separate, low-priority process.
- * Arguments: <sourceDir> <targetRoot> <vaultName> <configJson> <logFilePath>
- */
-
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-
-try {
-  os.setPriority(os.constants.priority.PRIORITY_BELOW_NORMAL);
-} catch (e) {
-  // platform doesn't support it, not a problem
-}
-
-const [sourceDir, targetRoot, vaultName, configJson, logFilePath] = process.argv.slice(2);
-
-let config = {};
-try { config = JSON.parse(configJson || '{}'); } catch (e) { config = {}; }
-
-const EXCLUDE = new Set(config.exclude || []);
-const KEEP_DAILY = Number.isFinite(config.keepDaily) ? config.keepDaily : 7;
-const KEEP_WEEKLY = Number.isFinite(config.keepWeekly) ? config.keepWeekly : 4;
-const KEEP_MONTHLY = Number.isFinite(config.keepMonthly) ? config.keepMonthly : 6;
+const fsp = fs.promises;
 
 const RETRIES = 3;
 const RETRY_WAIT_MS = 800;
 const COMPLETE_MARKER = '.backup-complete';
-
-function pad(n) { return String(n).padStart(2, '0'); }
-
-function stamp(d) {
-  d = d || new Date();
-  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
-    + '-' + pad(d.getHours()) + pad(d.getMinutes());
-}
-
-function sleep(ms) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
-function send(msg) {
-  // Plain newline-delimited JSON on stdout instead of child_process's
-  // fork()-only IPC channel (process.send) -- a bare stdout pipe needs no
-  // special IPC bootstrap, so it works the same whether this script is run
-  // by real node or by Electron acting as node (ELECTRON_RUN_AS_NODE=1).
-  try {
-    process.stdout.write(JSON.stringify(msg) + '\\n');
-  } catch (e) { /* the parent process may already be gone */ }
-}
-
-const stats = { dirs: 0, files: 0, bytes: 0, skipped: 0, errors: [] };
-const targetRootResolved = targetRoot ? path.resolve(targetRoot) : null;
-let totalFiles = 0;
-
-function countFiles(srcDir) {
-  let entries;
-  try {
-    entries = fs.readdirSync(srcDir, { withFileTypes: true });
-  } catch (err) {
-    return 0;
-  }
-
-  let count = 0;
-  for (const entry of entries) {
-    if (EXCLUDE.has(entry.name)) continue;
-
-    const from = path.join(srcDir, entry.name);
-    if (targetRootResolved && path.resolve(from) === targetRootResolved) continue;
-    if (entry.isSymbolicLink()) continue;
-
-    if (entry.isDirectory()) {
-      count += countFiles(from);
-    } else if (entry.isFile()) {
-      count++;
-    }
-  }
-  return count;
-}
-
-function copyFileWithRetry(src, dest, size) {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      fs.copyFileSync(src, dest);
-      try {
-        const st = fs.statSync(src);
-        fs.utimesSync(dest, st.atime, st.mtime);
-      } catch (e) { /* not critical */ }
-      stats.files++;
-      stats.bytes += size;
-      return;
-    } catch (err) {
-      if (attempt >= RETRIES) {
-        stats.errors.push(src + '  ->  ' + err.message);
-        return;
-      }
-      sleep(RETRY_WAIT_MS * attempt);
-    }
-  }
-}
-
-function copyTree(srcDir, destDir) {
-  let entries;
-  try {
-    entries = fs.readdirSync(srcDir, { withFileTypes: true });
-  } catch (err) {
-    stats.errors.push(srcDir + '  ->  ' + err.message);
-    return;
-  }
-
-  fs.mkdirSync(destDir, { recursive: true });
-  stats.dirs++;
-
-  for (const entry of entries) {
-    if (EXCLUDE.has(entry.name)) { stats.skipped++; continue; }
-
-    const from = path.join(srcDir, entry.name);
-    const to = path.join(destDir, entry.name);
-
-    if (targetRootResolved && path.resolve(from) === targetRootResolved) { stats.skipped++; continue; }
-
-    if (entry.isSymbolicLink()) {
-      try {
-        fs.symlinkSync(fs.readlinkSync(from), to);
-      } catch (e) {
-        stats.skipped++;
-      }
-      continue;
-    }
-
-    if (entry.isDirectory()) {
-      copyTree(from, to);
-      continue;
-    }
-
-    if (entry.isFile()) {
-      let size = 0;
-      try { size = fs.statSync(from).size; } catch (e) { /* doesn't matter */ }
-      copyFileWithRetry(from, to, size);
-      send({ type: 'progress', files: stats.files, total: totalFiles, bytes: stats.bytes });
-    }
-  }
-}
-
-function parseBackupDate(name, prefix) {
-  const rest = name.slice(prefix.length);
-  const m = rest.match(/^(\\d{4})-(\\d{2})-(\\d{2})-(\\d{2})(\\d{2})$/);
-  if (!m) return null;
-  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]));
-}
-
-function isoWeekKey(d) {
-  const date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
-  const dayNum = (date.getUTCDay() + 6) % 7;
-  date.setUTCDate(date.getUTCDate() - dayNum + 3);
-  const firstThursday = new Date(Date.UTC(date.getUTCFullYear(), 0, 4));
-  const week = 1 + Math.round(((date - firstThursday) / 86400000 - 3 + ((firstThursday.getUTCDay() + 6) % 7)) / 7);
-  return date.getUTCFullYear() + '-W' + pad(week);
-}
-
-function applyRetention(prefix) {
-  const deleted = [];
-  let entries;
-  try {
-    entries = fs.readdirSync(targetRoot, { withFileTypes: true });
-  } catch (err) {
-    stats.errors.push(targetRoot + '  ->  ' + err.message);
-    return deleted;
-  }
-
-  const backups = entries
-    .filter((e) => e.isDirectory() && e.name.startsWith(prefix))
-    .map((e) => ({ name: e.name, date: parseBackupDate(e.name, prefix) }))
-    .filter((b) => b.date instanceof Date && !isNaN(b.date))
-    // Only manage backups that finished copying. A folder from a run that
-    // crashed or was killed mid-copy has no marker and is left untouched,
-    // so it never gets mistaken for "the latest good snapshot" and never
-    // displaces a genuinely complete older backup.
-    .filter((b) => fs.existsSync(path.join(targetRoot, b.name, COMPLETE_MARKER)));
-
-  backups.sort((a, b) => b.date - a.date);
-  if (backups.length === 0) return deleted;
-
-  // The snapshot that was just created is always kept, regardless of the retention counts.
-  const keep = new Set([backups[0].name]);
-
-  function keepLatestPerGroup(keyFn, limit) {
-    const seen = new Set();
-    for (const b of backups) {
-      const key = keyFn(b.date);
-      if (!seen.has(key)) {
-        seen.add(key);
-        if (seen.size <= limit) keep.add(b.name);
-      }
-    }
-  }
-
-  keepLatestPerGroup((d) => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()), KEEP_DAILY);
-  keepLatestPerGroup((d) => isoWeekKey(d), KEEP_WEEKLY);
-  keepLatestPerGroup((d) => d.getFullYear() + '-' + pad(d.getMonth() + 1), KEEP_MONTHLY);
-
-  for (const b of backups) {
-    if (!keep.has(b.name)) {
-      try {
-        fs.rmSync(path.join(targetRoot, b.name), { recursive: true, force: true });
-        deleted.push(b.name);
-      } catch (err) {
-        stats.errors.push(path.join(targetRoot, b.name) + '  ->  ' + err.message);
-      }
-    }
-  }
-
-  return deleted;
-}
-
-function writeErrorLog(target) {
-  if (!stats.errors.length) return;
-  const lines = [];
-  lines.push('=== ' + new Date().toISOString() + ' ===');
-  lines.push('Target: ' + target);
-  for (const e of stats.errors) lines.push('  - ' + e);
-  lines.push('');
-  try {
-    fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
-    fs.appendFileSync(logFilePath, lines.join('\\n') + '\\n', 'utf8');
-  } catch (e) { /* if even this fails, there's nothing more we can do */ }
-}
-
-function main() {
-  if (!sourceDir || !targetRoot || !vaultName) {
-    send({ type: 'error', message: 'Missing parameters for the backup process.' });
-    process.exitCode = 1;
-    return;
-  }
-
-  if (!fs.existsSync(sourceDir)) {
-    send({ type: 'error', message: 'The source vault folder was not found: ' + sourceDir });
-    process.exitCode = 1;
-    return;
-  }
-
-  try {
-    fs.mkdirSync(targetRoot, { recursive: true });
-  } catch (err) {
-    send({ type: 'error', message: 'The target directory could not be created: ' + err.message });
-    process.exitCode = 1;
-    return;
-  }
-
-  const prefix = vaultName + '-';
-  const target = path.join(targetRoot, prefix + stamp());
-
-  if (fs.existsSync(target)) {
-    send({ type: 'error', message: 'The target folder already exists: ' + target });
-    process.exitCode = 1;
-    return;
-  }
-
-  totalFiles = countFiles(sourceDir);
-  send({ type: 'progress', files: 0, total: totalFiles, bytes: 0 });
-
-  copyTree(sourceDir, target);
-
-  try {
-    fs.writeFileSync(path.join(target, COMPLETE_MARKER), new Date().toISOString(), 'utf8');
-  } catch (err) {
-    stats.errors.push(target + '  ->  could not write completion marker: ' + err.message);
-  }
-
-  const deleted = applyRetention(prefix);
-  writeErrorLog(target);
-
-  send({
-    type: 'done',
-    files: stats.files,
-    dirs: stats.dirs,
-    bytes: stats.bytes,
-    skipped: stats.skipped,
-    errors: stats.errors,
-    deleted,
-    target,
-  });
-
-  process.exitCode = stats.errors.length ? 2 : 0;
-}
-
-main();
-`;
-// WORKER_SOURCE_END
+const COPY_TIMEOUT_MS = 60 * 1000;
 
 const DEFAULT_SETTINGS = {
   targetDir: '',
@@ -316,12 +27,269 @@ const DEFAULT_SETTINGS = {
 
 function pad(n) { return String(n).padStart(2, '0'); }
 
+function stamp(d) {
+  d = d || new Date();
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+    + '-' + pad(d.getHours()) + pad(d.getMinutes());
+}
+
 function humanSize(bytes) {
   const u = ['B', 'kB', 'MB', 'GB', 'TB'];
   let i = 0;
   let v = bytes || 0;
   while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
   return v.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('Timed out after ' + ms + 'ms: ' + label)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function parseBackupDate(name, prefix) {
+  const rest = name.slice(prefix.length);
+  const m = rest.match(/^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})$/);
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]));
+}
+
+function isoWeekKey(d) {
+  const date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = (date.getUTCDay() + 6) % 7;
+  date.setUTCDate(date.getUTCDate() - dayNum + 3);
+  const firstThursday = new Date(Date.UTC(date.getUTCFullYear(), 0, 4));
+  const week = 1 + Math.round(((date - firstThursday) / 86400000 - 3 + ((firstThursday.getUTCDay() + 6) % 7)) / 7);
+  return date.getUTCFullYear() + '-W' + pad(week);
+}
+
+async function pathExists(p) {
+  try { await fsp.access(p); return true; } catch (e) { return false; }
+}
+
+/**
+ * Runs one backup: copies sourceDir into a dated snapshot under targetRoot,
+ * then applies the daily/weekly/monthly retention policy. Every filesystem
+ * call is async (fs.promises), so the actual I/O happens on Node's libuv
+ * thread pool instead of Obsidian's main thread -- the UI never blocks,
+ * with no separate OS process needed to achieve that.
+ */
+class BackupRun {
+  constructor(opts) {
+    this.sourceDir = opts.sourceDir;
+    this.targetRoot = opts.targetRoot;
+    this.targetRootResolved = path.resolve(opts.targetRoot);
+    this.vaultName = opts.vaultName;
+    this.exclude = new Set(opts.exclude || []);
+    this.keepDaily = Number.isFinite(opts.keepDaily) ? opts.keepDaily : 7;
+    this.keepWeekly = Number.isFinite(opts.keepWeekly) ? opts.keepWeekly : 4;
+    this.keepMonthly = Number.isFinite(opts.keepMonthly) ? opts.keepMonthly : 6;
+    this.logFilePath = opts.logFilePath;
+    this.onProgress = opts.onProgress || (() => {});
+    this.stats = { dirs: 0, files: 0, bytes: 0, skipped: 0, errors: [] };
+    this.totalFiles = 0;
+  }
+
+  async countFiles(dir) {
+    let entries;
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch (err) {
+      return 0;
+    }
+
+    let count = 0;
+    for (const entry of entries) {
+      if (this.exclude.has(entry.name)) continue;
+      const from = path.join(dir, entry.name);
+      if (path.resolve(from) === this.targetRootResolved) continue;
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) count += await this.countFiles(from);
+      else if (entry.isFile()) count++;
+    }
+    return count;
+  }
+
+  async copyFileWithRetry(src, dest, size) {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await withTimeout(fsp.copyFile(src, dest), COPY_TIMEOUT_MS, src);
+        try {
+          const st = await fsp.stat(src);
+          await fsp.utimes(dest, st.atime, st.mtime);
+        } catch (e) { /* not critical */ }
+        this.stats.files++;
+        this.stats.bytes += size;
+        return;
+      } catch (err) {
+        if (attempt >= RETRIES) {
+          this.stats.errors.push(src + '  ->  ' + err.message);
+          return;
+        }
+        await sleep(RETRY_WAIT_MS * attempt);
+      }
+    }
+  }
+
+  async copyTree(srcDir, destDir) {
+    let entries;
+    try {
+      entries = await fsp.readdir(srcDir, { withFileTypes: true });
+    } catch (err) {
+      this.stats.errors.push(srcDir + '  ->  ' + err.message);
+      return;
+    }
+
+    await fsp.mkdir(destDir, { recursive: true });
+    this.stats.dirs++;
+
+    for (const entry of entries) {
+      if (this.exclude.has(entry.name)) { this.stats.skipped++; continue; }
+
+      const from = path.join(srcDir, entry.name);
+      const to = path.join(destDir, entry.name);
+
+      if (path.resolve(from) === this.targetRootResolved) { this.stats.skipped++; continue; }
+
+      if (entry.isSymbolicLink()) {
+        try {
+          await fsp.symlink(await fsp.readlink(from), to);
+        } catch (e) {
+          this.stats.skipped++;
+        }
+        continue;
+      }
+
+      if (entry.isDirectory()) {
+        await this.copyTree(from, to);
+        continue;
+      }
+
+      if (entry.isFile()) {
+        let size = 0;
+        try { size = (await fsp.stat(from)).size; } catch (e) { /* doesn't matter */ }
+        await this.copyFileWithRetry(from, to, size);
+        this.onProgress({ files: this.stats.files, total: this.totalFiles, bytes: this.stats.bytes });
+      }
+    }
+  }
+
+  async applyRetention(prefix) {
+    const deleted = [];
+    let entries;
+    try {
+      entries = await fsp.readdir(this.targetRoot, { withFileTypes: true });
+    } catch (err) {
+      this.stats.errors.push(this.targetRoot + '  ->  ' + err.message);
+      return deleted;
+    }
+
+    const backups = [];
+    for (const e of entries) {
+      if (!e.isDirectory() || !e.name.startsWith(prefix)) continue;
+      const date = parseBackupDate(e.name, prefix);
+      if (!(date instanceof Date) || isNaN(date)) continue;
+      // Only manage backups that finished copying. A folder from a run that
+      // crashed or was interrupted mid-copy has no marker and is left
+      // untouched, so it never gets mistaken for "the latest good snapshot"
+      // and never displaces a genuinely complete older backup.
+      const complete = await pathExists(path.join(this.targetRoot, e.name, COMPLETE_MARKER));
+      if (!complete) continue;
+      backups.push({ name: e.name, date });
+    }
+
+    backups.sort((a, b) => b.date - a.date);
+    if (backups.length === 0) return deleted;
+
+    // The snapshot that was just created is always kept, regardless of the retention counts.
+    const keep = new Set([backups[0].name]);
+
+    const keepLatestPerGroup = (keyFn, limit) => {
+      const seen = new Set();
+      for (const b of backups) {
+        const key = keyFn(b.date);
+        if (!seen.has(key)) {
+          seen.add(key);
+          if (seen.size <= limit) keep.add(b.name);
+        }
+      }
+    };
+
+    keepLatestPerGroup((d) => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()), this.keepDaily);
+    keepLatestPerGroup((d) => isoWeekKey(d), this.keepWeekly);
+    keepLatestPerGroup((d) => d.getFullYear() + '-' + pad(d.getMonth() + 1), this.keepMonthly);
+
+    for (const b of backups) {
+      if (!keep.has(b.name)) {
+        try {
+          await fsp.rm(path.join(this.targetRoot, b.name), { recursive: true, force: true });
+          deleted.push(b.name);
+        } catch (err) {
+          this.stats.errors.push(path.join(this.targetRoot, b.name) + '  ->  ' + err.message);
+        }
+      }
+    }
+
+    return deleted;
+  }
+
+  async writeErrorLog(target) {
+    if (!this.stats.errors.length) return;
+    const lines = [];
+    lines.push('=== ' + new Date().toISOString() + ' ===');
+    lines.push('Target: ' + target);
+    for (const e of this.stats.errors) lines.push('  - ' + e);
+    lines.push('');
+    try {
+      await fsp.mkdir(path.dirname(this.logFilePath), { recursive: true });
+      await fsp.appendFile(this.logFilePath, lines.join('\n') + '\n', 'utf8');
+    } catch (e) { /* if even this fails, there's nothing more we can do */ }
+  }
+
+  async run() {
+    if (!(await pathExists(this.sourceDir))) {
+      throw new Error('The source vault folder was not found: ' + this.sourceDir);
+    }
+
+    await fsp.mkdir(this.targetRoot, { recursive: true });
+
+    const prefix = this.vaultName + '-';
+    const target = path.join(this.targetRoot, prefix + stamp());
+
+    if (await pathExists(target)) {
+      throw new Error('The target folder already exists: ' + target);
+    }
+
+    this.totalFiles = await this.countFiles(this.sourceDir);
+    this.onProgress({ files: 0, total: this.totalFiles, bytes: 0 });
+
+    await this.copyTree(this.sourceDir, target);
+
+    try {
+      await fsp.writeFile(path.join(target, COMPLETE_MARKER), new Date().toISOString(), 'utf8');
+    } catch (err) {
+      this.stats.errors.push(target + '  ->  could not write completion marker: ' + err.message);
+    }
+
+    const deleted = await this.applyRetention(prefix);
+    await this.writeErrorLog(target);
+
+    return {
+      files: this.stats.files,
+      dirs: this.stats.dirs,
+      bytes: this.stats.bytes,
+      skipped: this.stats.skipped,
+      errors: this.stats.errors,
+      deleted,
+      target,
+    };
+  }
 }
 
 class SimpleBackupPlugin extends Plugin {
@@ -362,7 +330,9 @@ class SimpleBackupPlugin extends Plugin {
 
   onunload() {
     if (this.settings && this.settings.runOnShutdown) {
-      this.runBackup({ trigger: 'shutdown', detached: true });
+      // Best-effort: this runs inside Obsidian's own process, so it only
+      // completes if Obsidian stays open long enough to finish copying.
+      this.runBackup({ trigger: 'shutdown' });
     }
   }
 
@@ -425,7 +395,7 @@ class SimpleBackupPlugin extends Plugin {
     }
   }
 
-  runBackup({ trigger, detached = false } = {}) {
+  async runBackup({ trigger } = {}) {
     if (this.isRunning) {
       new Notice('A backup is already in progress.');
       return;
@@ -448,165 +418,71 @@ class SimpleBackupPlugin extends Plugin {
       return;
     }
 
-    const pluginDir = this.getPluginDir();
-    const workerPath = path.join(pluginDir, 'backup-worker.js');
-    try {
-      fs.mkdirSync(pluginDir, { recursive: true });
-      fs.writeFileSync(workerPath, WORKER_SOURCE, 'utf8');
-    } catch (err) {
-      new Notice('Error: could not write backup-worker.js: ' + err.message);
-      return;
-    }
-
     const vaultName = this.app.vault.getName();
     const logFilePath = this.getLogFilePath();
-
-    const config = {
-      exclude: this.settings.excludeList,
-      keepDaily: this.settings.keepDaily,
-      keepWeekly: this.settings.keepWeekly,
-      keepMonthly: this.settings.keepMonthly,
-    };
-
-    const args = [basePath, targetDir, vaultName, JSON.stringify(config), logFilePath];
 
     this.isRunning = true;
     this.activeNotice = new Notice('Backup: scanning files...', 0);
 
-    let child;
-    try {
-      child = spawn(process.execPath, [workerPath, ...args], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        detached: detached,
-        windowsHide: true,
-        // Obsidian's process.execPath points at the Electron binary; without this,
-        // Electron would try to launch a whole new app window instead of running
-        // this script as plain Node.
-        env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' }),
-      });
-    } catch (err) {
-      this.isRunning = false;
-      if (this.activeNotice) this.activeNotice.hide();
-      new Notice('Error starting the backup: ' + err.message);
-      return;
-    }
-
-    if (detached) {
-      child.unref();
-    }
-
-    let finished = false;
-    let stderrBuf = '';
-    let stdoutBuf = '';
-    if (child.stderr) child.stderr.on('data', (d) => { stderrBuf += d.toString(); });
-
-    const appendLog = (text) => {
-      try {
-        fs.mkdirSync(path.dirname(logFilePath), { recursive: true });
-        fs.appendFileSync(logFilePath, `=== ${new Date().toISOString()} ===\n${text}\n\n`, 'utf8');
-      } catch (e) { /* best effort */ }
-    };
-
-    let lastMessageAt = Date.now();
-    const STALL_TIMEOUT_MS = 10 * 60 * 1000;
-    const watchdog = this.registerInterval(window.setInterval(() => {
-      if (!finished && Date.now() - lastMessageAt > STALL_TIMEOUT_MS) {
-        try { child.kill(); } catch (e) { /* already gone */ }
-      }
-    }, 30 * 1000));
-
-    const finishWithMessage = (text, timeoutMs) => {
-      finished = true;
-      window.clearInterval(watchdog);
-      this.isRunning = false;
-      if (this.activeNotice) {
-        const notice = this.activeNotice;
-        notice.setMessage(text);
-        setTimeout(() => notice.hide(), timeoutMs);
-        this.activeNotice = null;
-      }
-    };
-
     let lastUpdate = 0;
-    const handleMessage = (msg) => {
-      if (!msg || typeof msg !== 'object') return;
-      lastMessageAt = Date.now();
-
-      if (msg.type === 'progress') {
+    const run = new BackupRun({
+      sourceDir: basePath,
+      targetRoot: targetDir,
+      vaultName,
+      exclude: this.settings.excludeList,
+      keepDaily: this.settings.keepDaily,
+      keepWeekly: this.settings.keepWeekly,
+      keepMonthly: this.settings.keepMonthly,
+      logFilePath,
+      onProgress: (p) => {
         const now = Date.now();
         if (now - lastUpdate > 400 && this.activeNotice) {
           lastUpdate = now;
-          const fileLabel = msg.total ? `${msg.files}/${msg.total} files` : `${msg.files} files`;
-          this.activeNotice.setMessage(`Backing up: ${fileLabel}, ${humanSize(msg.bytes)}`);
+          const fileLabel = p.total ? `${p.files}/${p.total} files` : `${p.files} files`;
+          this.activeNotice.setMessage(`Backing up: ${fileLabel}, ${humanSize(p.bytes)}`);
         }
-        return;
-      }
+      },
+    });
 
-      if (msg.type === 'done') {
-        finishWithMessage(
-          msg.errors && msg.errors.length
-            ? `Backup finished with errors (${msg.errors.length}). See backup-errors.log`
-            : `Backup finished: ${msg.files} files, ${humanSize(msg.bytes)}`,
-          4000
+    try {
+      const result = await run.run();
+      this.isRunning = false;
+      if (this.activeNotice) {
+        const notice = this.activeNotice;
+        notice.setMessage(
+          result.errors.length
+            ? `Backup finished with errors (${result.errors.length}). See backup-errors.log`
+            : `Backup finished: ${result.files} files, ${humanSize(result.bytes)}`
         );
-        this.settings.lastRun = {
-          time: Date.now(),
-          trigger,
-          files: msg.files,
-          bytes: msg.bytes,
-          errors: msg.errors ? msg.errors.length : 0,
-          deleted: msg.deleted ? msg.deleted.length : 0,
-        };
-        this.saveSettings();
-        return;
+        setTimeout(() => notice.hide(), 4000);
+        this.activeNotice = null;
       }
-
-      if (msg.type === 'error') {
-        finishWithMessage('Backup error: ' + msg.message, 6000);
-        appendLog('Worker reported an error:\n' + msg.message);
+      this.settings.lastRun = {
+        time: Date.now(),
+        trigger,
+        files: result.files,
+        bytes: result.bytes,
+        errors: result.errors.length,
+        deleted: result.deleted.length,
+      };
+      await this.saveSettings();
+    } catch (err) {
+      this.isRunning = false;
+      const message = err && err.message ? err.message : String(err);
+      console.error('Simple Backup error:', err);
+      if (this.activeNotice) {
+        const notice = this.activeNotice;
+        notice.setMessage('Backup error: ' + message);
+        setTimeout(() => notice.hide(), 8000);
+        this.activeNotice = null;
       }
-    };
-
-    // The worker writes one JSON object per line on stdout instead of using
-    // child_process's fork()-only IPC channel (see backup-worker.js's send()).
-    if (child.stdout) {
-      child.stdout.on('data', (d) => {
-        stdoutBuf += d.toString();
-        let idx;
-        while ((idx = stdoutBuf.indexOf('\n')) !== -1) {
-          const line = stdoutBuf.slice(0, idx).trim();
-          stdoutBuf = stdoutBuf.slice(idx + 1);
-          if (!line) continue;
-          let msg;
-          try { msg = JSON.parse(line); } catch (e) { continue; }
-          handleMessage(msg);
+      try {
+        if (logFilePath) {
+          await fsp.mkdir(path.dirname(logFilePath), { recursive: true });
+          await fsp.appendFile(logFilePath, `=== ${new Date().toISOString()} ===\n${message}\n\n`, 'utf8');
         }
-      });
+      } catch (e) { /* best effort */ }
     }
-
-    child.on('error', (err) => {
-      finishWithMessage('Backup process error: ' + err.message, 6000);
-      appendLog('Failed to start the backup process: ' + err.message);
-    });
-
-    child.on('exit', (code, signal) => {
-      if (finished) return;
-      // The worker never sent a 'done'/'error' message before exiting -- an
-      // uncaught crash, or something killed it. Surface whatever it printed
-      // to stderr instead of leaving the progress Notice stuck forever.
-      const detail = stderrBuf.trim()
-        ? stderrBuf.trim().split('\n')[0]
-        : signal ? `killed (signal ${signal})` : `exit code ${code}`;
-      finishWithMessage(`Backup process ended unexpectedly: ${detail}`, 10000);
-      console.error('Simple Backup: worker exited unexpectedly. code=' + code + ' signal=' + signal
-        + (stderrBuf ? '\nstderr:\n' + stderrBuf : '')
-        + (stdoutBuf ? '\nunparsed stdout:\n' + stdoutBuf : ''));
-      appendLog(
-        `Worker exited unexpectedly (code ${code}, signal ${signal}).\n`
-        + (stderrBuf ? 'stderr:\n' + stderrBuf + '\n' : 'stderr: (empty)\n')
-        + (stdoutBuf ? 'unparsed stdout:\n' + stdoutBuf : 'unparsed stdout: (empty)')
-      );
-    });
   }
 
   async loadSettings() {
@@ -663,7 +539,7 @@ class SimpleBackupSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Run on shutdown')
-      .setDesc('Automatically run a backup whenever this plugin is unloaded — closing Obsidian, but also disabling this plugin or switching to another vault (the background process keeps running after Obsidian exits).')
+      .setDesc('Best-effort: try to run a backup whenever this plugin is unloaded (closing Obsidian, disabling the plugin, or switching vaults). It runs inside Obsidian itself, so it only completes if Obsidian stays open long enough to finish copying — for a large vault, prefer "Run on startup" or a scheduled time instead.')
       .addToggle((t) => t
         .setValue(this.plugin.settings.runOnShutdown)
         .onChange(async (v) => { this.plugin.settings.runOnShutdown = v; await this.plugin.saveSettings(); }));
