@@ -33,7 +33,7 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 |---|---|
 | Target directory | Absolute path of the folder where dated backup snapshots are created. Required. |
 | Run on startup | Trigger a backup automatically whenever Obsidian opens the vault. |
-| Run on shutdown | Trigger a backup automatically when Obsidian closes; the copy continues in the background after Obsidian exits. |
+| Run on shutdown | Trigger a backup automatically whenever the plugin is unloaded (closing Obsidian, disabling the plugin, or switching vaults); the copy continues in the background after Obsidian exits. |
 | Run hourly | Trigger a backup once per hour. |
 | Run daily | Trigger a backup once a day at a set `HH:MM` (local time). |
 | Keep daily / weekly / monthly | How many most-recent daily/weekly/monthly snapshots to retain. |
@@ -45,14 +45,22 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 
 ## Installation (manual)
 
-1. Copy `manifest.json`, `main.js`, and `backup-worker.js` into `<your-vault>/.obsidian/plugins/simple-backup/`.
+1. Copy `manifest.json` and `main.js` into `<your-vault>/.obsidian/plugins/simple-backup/`.
 2. Reload Obsidian (or toggle the plugin off/on) and enable **Simple Backup** under `Settings → Community plugins`.
 3. Open the plugin's settings and set a target directory before running your first backup.
 
+## Known limitations
+
+- **The plugin can't tell "Obsidian is closing" apart from "this plugin was disabled" or "you switched vaults"** — Obsidian's API fires the same lifecycle hook for all three. "Run on shutdown" runs on all of them.
+- **A backup interrupted mid-copy** (Obsidian force-quit, machine lost power, target drive disconnected) is left exactly as it is — it's never auto-deleted, but it's also excluded from the daily/weekly/monthly retention accounting, so it won't accidentally count as "the latest good snapshot" either. Clean it up manually if you find one (it has no `.backup-complete` marker file inside it).
+- **The target directory can't be the vault itself.** It can be a subfolder of the vault, or any other location — just not the vault's root path exactly.
+- **The "Browse…" folder picker** depends on Electron's `remote.dialog`, which isn't part of every Obsidian/Electron build. If it's unavailable, the button shows a notice and you can still type the path in by hand.
+
 ## Project layout
 
-- `main.js` — the plugin itself: settings UI, scheduling, ribbon icon/command, and orchestration of the background process.
-- `backup-worker.js` — the standalone Node.js script that actually copies files and applies the retention policy, run as a separate low-priority child process so it never competes with Obsidian's own work.
+- `main.js` — the whole plugin: settings UI, scheduling, ribbon icon/command, and orchestration of the background process. It embeds the full source of `backup-worker.js` as a string and writes it out to the plugin folder itself before every run (Obsidian's installer only ever downloads `manifest.json`/`main.js`/`styles.css` from a release, so a second top-level file would never reach anyone who installs from the community plugin browser).
+- `backup-worker.js` — the readable, independently-testable source of that worker: the standalone Node.js script that actually copies files, writes the completion marker, and applies the retention policy, run as a separate low-priority child process so it never competes with Obsidian's own work.
+- `sync-worker.js` — run `node sync-worker.js` after editing `backup-worker.js` to re-embed it into `main.js`.
 - `manifest.json` — standard Obsidian plugin manifest.
 
 ## License

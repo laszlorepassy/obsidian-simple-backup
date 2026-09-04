@@ -28,6 +28,7 @@ const KEEP_MONTHLY = Number.isFinite(config.keepMonthly) ? config.keepMonthly : 
 
 const RETRIES = 3;
 const RETRY_WAIT_MS = 800;
+const COMPLETE_MARKER = '.backup-complete';
 
 function pad(n) { return String(n).padStart(2, '0'); }
 
@@ -135,9 +136,7 @@ function copyTree(srcDir, destDir) {
       let size = 0;
       try { size = fs.statSync(from).size; } catch (e) { /* doesn't matter */ }
       copyFileWithRetry(from, to, size);
-      if (stats.files % 25 === 0) {
-        send({ type: 'progress', files: stats.files, total: totalFiles, bytes: stats.bytes });
-      }
+      send({ type: 'progress', files: stats.files, total: totalFiles, bytes: stats.bytes });
     }
   }
 }
@@ -171,7 +170,12 @@ function applyRetention(prefix) {
   const backups = entries
     .filter((e) => e.isDirectory() && e.name.startsWith(prefix))
     .map((e) => ({ name: e.name, date: parseBackupDate(e.name, prefix) }))
-    .filter((b) => b.date instanceof Date && !isNaN(b.date));
+    .filter((b) => b.date instanceof Date && !isNaN(b.date))
+    // Only manage backups that finished copying. A folder from a run that
+    // crashed or was killed mid-copy has no marker and is left untouched,
+    // so it never gets mistaken for "the latest good snapshot" and never
+    // displaces a genuinely complete older backup.
+    .filter((b) => fs.existsSync(path.join(targetRoot, b.name, COMPLETE_MARKER)));
 
   backups.sort((a, b) => b.date - a.date);
   if (backups.length === 0) return deleted;
@@ -255,6 +259,13 @@ function main() {
   send({ type: 'progress', files: 0, total: totalFiles, bytes: 0 });
 
   copyTree(sourceDir, target);
+
+  try {
+    fs.writeFileSync(path.join(target, COMPLETE_MARKER), new Date().toISOString(), 'utf8');
+  } catch (err) {
+    stats.errors.push(target + '  ->  could not write completion marker: ' + err.message);
+  }
+
   const deleted = applyRetention(prefix);
   writeErrorLog(target);
 
