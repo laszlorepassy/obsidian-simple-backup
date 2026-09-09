@@ -1,0 +1,11 @@
+{
+  "name": "obsidian-simple-backup",
+  "private": true,
+  "version": "1.1.0",
+  "description": "Backs up the vault to a folder of your choice, versioned by date and time, with automatic daily/weekly/monthly retention.",
+  "main": "main.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT"
+}
