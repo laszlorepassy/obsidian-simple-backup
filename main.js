@@ -32,12 +32,12 @@ var require_backup_core = __commonJS({
       lastRun: null,
       lastDailyRunDate: null
     };
-    function pad2(n) {
+    function pad(n) {
       return String(n).padStart(2, "0");
     }
     function stamp(d) {
       d = d || /* @__PURE__ */ new Date();
-      return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + "-" + pad2(d.getHours()) + pad2(d.getMinutes());
+      return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + "-" + pad(d.getHours()) + pad(d.getMinutes());
     }
     function humanSize2(bytes) {
       const u = ["B", "kB", "MB", "GB", "TB"];
@@ -71,7 +71,7 @@ var require_backup_core = __commonJS({
       date.setUTCDate(date.getUTCDate() - dayNum + 3);
       const firstThursday = new Date(Date.UTC(date.getUTCFullYear(), 0, 4));
       const week = 1 + Math.round(((date - firstThursday) / 864e5 - 3 + (firstThursday.getUTCDay() + 6) % 7) / 7);
-      return date.getUTCFullYear() + "-W" + pad2(week);
+      return date.getUTCFullYear() + "-W" + pad(week);
     }
     async function pathExists(p) {
       try {
@@ -80,6 +80,22 @@ var require_backup_core = __commonJS({
       } catch (e) {
         return false;
       }
+    }
+    function isSameLocalDay(a, b) {
+      return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+    }
+    function dailyScheduleDecision2(settings, now) {
+      if (!settings.runDaily) return { run: false, lastDailyRunDate: settings.lastDailyRunDate };
+      const today = now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate());
+      if (settings.lastDailyRunDate === today) return { run: false, lastDailyRunDate: settings.lastDailyRunDate };
+      if (settings.lastRun && settings.lastRun.time && isSameLocalDay(new Date(settings.lastRun.time), now)) {
+        return { run: false, lastDailyRunDate: today };
+      }
+      const hhmm = pad(now.getHours()) + ":" + pad(now.getMinutes());
+      if (hhmm >= settings.dailyTime) {
+        return { run: true, lastDailyRunDate: today };
+      }
+      return { run: false, lastDailyRunDate: settings.lastDailyRunDate };
     }
     var BackupRun2 = class {
       constructor(opts) {
@@ -117,17 +133,23 @@ var require_backup_core = __commonJS({
       }
       async copyFileWithRetry(src, dest, size) {
         for (let attempt = 1; ; attempt++) {
+          const tmpDest = dest + ".tmp-" + process.pid + "-" + Date.now() + "-" + attempt;
           try {
-            await withTimeout(fsp2.copyFile(src, dest), COPY_TIMEOUT_MS, src);
+            await withTimeout(fsp2.copyFile(src, tmpDest), COPY_TIMEOUT_MS, src);
             try {
               const st = await fsp2.stat(src);
-              await fsp2.utimes(dest, st.atime, st.mtime);
+              await fsp2.utimes(tmpDest, st.atime, st.mtime);
             } catch (e) {
             }
+            await fsp2.rename(tmpDest, dest);
             this.stats.files++;
             this.stats.bytes += size;
             return;
           } catch (err) {
+            try {
+              await fsp2.unlink(tmpDest);
+            } catch (e) {
+            }
             if (attempt >= RETRIES) {
               this.stats.errors.push(src + "  ->  " + err.message);
               return;
@@ -211,9 +233,9 @@ var require_backup_core = __commonJS({
             }
           }
         };
-        keepLatestPerGroup((d) => d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()), this.keepDaily);
+        keepLatestPerGroup((d) => d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()), this.keepDaily);
         keepLatestPerGroup((d) => isoWeekKey(d), this.keepWeekly);
-        keepLatestPerGroup((d) => d.getFullYear() + "-" + pad2(d.getMonth() + 1), this.keepMonthly);
+        keepLatestPerGroup((d) => d.getFullYear() + "-" + pad(d.getMonth() + 1), this.keepMonthly);
         for (const b of backups) {
           if (!keep.has(b.name)) {
             try {
@@ -276,7 +298,7 @@ var require_backup_core = __commonJS({
       COMPLETE_MARKER,
       COPY_TIMEOUT_MS,
       DEFAULT_SETTINGS: DEFAULT_SETTINGS2,
-      pad: pad2,
+      pad,
       stamp,
       humanSize: humanSize2,
       sleep,
@@ -284,6 +306,8 @@ var require_backup_core = __commonJS({
       parseBackupDate,
       isoWeekKey,
       pathExists,
+      isSameLocalDay,
+      dailyScheduleDecision: dailyScheduleDecision2,
       BackupRun: BackupRun2
     };
   }
@@ -294,7 +318,7 @@ var { Plugin, PluginSettingTab, Setting, Notice } = require("obsidian");
 var path = require("path");
 var fs = require("fs");
 var fsp = fs.promises;
-var { DEFAULT_SETTINGS, pad, humanSize, BackupRun } = require_backup_core();
+var { DEFAULT_SETTINGS, humanSize, BackupRun, dailyScheduleDecision } = require_backup_core();
 var SimpleBackupPlugin = class extends Plugin {
   async onload() {
     await this.loadSettings();
@@ -324,14 +348,12 @@ var SimpleBackupPlugin = class extends Plugin {
     }, 60 * 1e3));
   }
   checkDailySchedule() {
-    if (!this.settings.runDaily) return;
-    const now = /* @__PURE__ */ new Date();
-    const hh = pad(now.getHours());
-    const mm = pad(now.getMinutes());
-    const today = now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate());
-    if (`${hh}:${mm}` === this.settings.dailyTime && this.settings.lastDailyRunDate !== today) {
-      this.settings.lastDailyRunDate = today;
+    const decision = dailyScheduleDecision(this.settings, /* @__PURE__ */ new Date());
+    if (decision.lastDailyRunDate !== this.settings.lastDailyRunDate) {
+      this.settings.lastDailyRunDate = decision.lastDailyRunDate;
       this.saveSettings();
+    }
+    if (decision.run) {
       this.runBackup({ trigger: "daily" });
     }
   }
