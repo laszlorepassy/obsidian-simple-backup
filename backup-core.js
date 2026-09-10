@@ -71,6 +71,39 @@ async function pathExists(p) {
   try { await fsp.access(p); return true; } catch (e) { return false; }
 }
 
+function isSameLocalDay(a, b) {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+}
+
+/**
+ * Decides whether the daily schedule should fire "now". Pure function (no I/O,
+ * no Date.now() inside) so the scheduling logic can be unit-tested without a
+ * live timer or the Obsidian runtime.
+ *
+ * Catches up (fires as soon as the current time passes dailyTime) instead of
+ * requiring an exact HH:MM match, so a missed minute (sleep, Obsidian closed,
+ * a slow tick) doesn't skip the whole day. But if a backup from any trigger
+ * (startup/manual/hourly) already completed today, that satisfies the daily
+ * requirement instead of firing a second full backup.
+ */
+function dailyScheduleDecision(settings, now) {
+  if (!settings.runDaily) return { run: false, lastDailyRunDate: settings.lastDailyRunDate };
+
+  const today = now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate());
+  if (settings.lastDailyRunDate === today) return { run: false, lastDailyRunDate: settings.lastDailyRunDate };
+
+  if (settings.lastRun && settings.lastRun.time && isSameLocalDay(new Date(settings.lastRun.time), now)) {
+    return { run: false, lastDailyRunDate: today };
+  }
+
+  const hhmm = pad(now.getHours()) + ':' + pad(now.getMinutes());
+  if (hhmm >= settings.dailyTime) {
+    return { run: true, lastDailyRunDate: today };
+  }
+
+  return { run: false, lastDailyRunDate: settings.lastDailyRunDate };
+}
+
 /**
  * Runs one backup: copies sourceDir into a dated snapshot under targetRoot,
  * then applies the daily/weekly/monthly retention policy. Every filesystem
@@ -116,16 +149,24 @@ class BackupRun {
 
   async copyFileWithRetry(src, dest, size) {
     for (let attempt = 1; ; attempt++) {
+      // Copy to a per-attempt temp path and rename into place on success. withTimeout()
+      // can't actually cancel the underlying fsp.copyFile -- on timeout the write may still
+      // be in flight -- so copying straight to `dest` risks a retry's copyFile racing the
+      // timed-out one on the very same path and leaving a corrupted file. A unique temp
+      // path per attempt means a still-running timed-out copy can never collide with dest.
+      const tmpDest = dest + '.tmp-' + process.pid + '-' + Date.now() + '-' + attempt;
       try {
-        await withTimeout(fsp.copyFile(src, dest), COPY_TIMEOUT_MS, src);
+        await withTimeout(fsp.copyFile(src, tmpDest), COPY_TIMEOUT_MS, src);
         try {
           const st = await fsp.stat(src);
-          await fsp.utimes(dest, st.atime, st.mtime);
+          await fsp.utimes(tmpDest, st.atime, st.mtime);
         } catch (e) { /* not critical */ }
+        await fsp.rename(tmpDest, dest);
         this.stats.files++;
         this.stats.bytes += size;
         return;
       } catch (err) {
+        try { await fsp.unlink(tmpDest); } catch (e) { /* best effort; may still be in use */ }
         if (attempt >= RETRIES) {
           this.stats.errors.push(src + '  ->  ' + err.message);
           return;
@@ -310,5 +351,7 @@ module.exports = {
   parseBackupDate,
   isoWeekKey,
   pathExists,
+  isSameLocalDay,
+  dailyScheduleDecision,
   BackupRun,
 };

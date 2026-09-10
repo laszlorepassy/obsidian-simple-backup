@@ -4,7 +4,7 @@ const { Plugin, PluginSettingTab, Setting, Notice } = require('obsidian');
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
-const { DEFAULT_SETTINGS, pad, humanSize, BackupRun } = require('../backup-core');
+const { DEFAULT_SETTINGS, humanSize, BackupRun, dailyScheduleDecision } = require('../backup-core');
 
 class SimpleBackupPlugin extends Plugin {
   async onload() {
@@ -43,14 +43,12 @@ class SimpleBackupPlugin extends Plugin {
   }
 
   checkDailySchedule() {
-    if (!this.settings.runDaily) return;
-    const now = new Date();
-    const hh = pad(now.getHours());
-    const mm = pad(now.getMinutes());
-    const today = now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate());
-    if (`${hh}:${mm}` === this.settings.dailyTime && this.settings.lastDailyRunDate !== today) {
-      this.settings.lastDailyRunDate = today;
+    const decision = dailyScheduleDecision(this.settings, new Date());
+    if (decision.lastDailyRunDate !== this.settings.lastDailyRunDate) {
+      this.settings.lastDailyRunDate = decision.lastDailyRunDate;
       this.saveSettings();
+    }
+    if (decision.run) {
       this.runBackup({ trigger: 'daily' });
     }
   }
