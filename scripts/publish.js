@@ -23,11 +23,16 @@ function readJson(file) {
 }
 
 function sh(cmd, args, opts = {}) {
-  // On Windows, npm is a .cmd shim; execFileSync needs the exact name
-  // (shell:true would work too, but breaks quoting of multi-word args
-  // like commit messages).
-  if (process.platform === 'win32' && cmd === 'npm') cmd = 'npm.cmd';
-  const result = execFileSync(cmd, args, { cwd: root, encoding: 'utf8', ...opts });
+  // On Windows, npm is a .cmd shim, which Node refuses to spawn directly
+  // without shell:true. Only turn shell:true on for that one case — it
+  // mangles quoting of multi-word args (e.g. `git tag -m "..."`), and
+  // git/gh are plain .exe files that don't need it.
+  let shell = false;
+  if (process.platform === 'win32' && cmd === 'npm') {
+    cmd = 'npm.cmd';
+    shell = true;
+  }
+  const result = execFileSync(cmd, args, { cwd: root, encoding: 'utf8', shell, ...opts });
   return typeof result === 'string' ? result.trim() : result;
 }
 
