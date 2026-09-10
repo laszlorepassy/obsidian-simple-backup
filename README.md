@@ -58,7 +58,10 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 
 ## Project layout
 
-- `main.js` — the entire plugin: settings UI, scheduling, ribbon icon/command, and the `BackupRun` class that does the actual asynchronous copying and retention.
+- `src/main.js` — the plugin entry point: settings UI, scheduling, and the ribbon icon/command.
+- `backup-core.js` — the `BackupRun` class and helpers that do the actual asynchronous copying and retention. Required by `src/main.js` and by the test suite.
+- `build.js` — bundles `src/main.js` + `backup-core.js` into a single, self-contained `main.js` at the repo root (via esbuild). Run `npm run build` after editing either source file.
+- `main.js` (repo root) — the **generated, distributable build output**. This is the file that actually ships — don't edit it directly, it's overwritten by `npm run build`. It has to be self-contained because Obsidian's community plugin installer and BRAT only ever fetch `manifest.json`, `main.js`, and `styles.css` — nothing else.
 - `manifest.json` — standard Obsidian plugin manifest.
 
 ## License
