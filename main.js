@@ -21,13 +21,13 @@ var require_backup_core = __commonJS({
     var COPY_TIMEOUT_MS = 60 * 1e3;
     var DEFAULT_SETTINGS2 = {
       targetDir: "",
-      runOnStartup: true,
+      runOnStartup: false,
       runHourly: false,
       runDaily: true,
       dailyTime: "20:00",
-      keepDaily: 7,
+      keepDaily: 3,
       keepWeekly: 4,
-      keepMonthly: 6,
+      keepMonthly: 12,
       excludeList: ["node_modules", ".git", ".trash", ".DS_Store", "Thumbs.db", "desktop.ini", "$RECYCLE.BIN", "System Volume Information"],
       lastRun: null,
       lastDailyRunDate: null
