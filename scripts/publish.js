@@ -23,10 +23,11 @@ function readJson(file) {
 }
 
 function sh(cmd, args, opts = {}) {
-  // On Windows, npm/gh are .cmd/.ps1 shims that execFileSync can't exec
-  // directly without a shell.
-  const shell = process.platform === 'win32';
-  const result = execFileSync(cmd, args, { cwd: root, encoding: 'utf8', shell, ...opts });
+  // On Windows, npm is a .cmd shim; execFileSync needs the exact name
+  // (shell:true would work too, but breaks quoting of multi-word args
+  // like commit messages).
+  if (process.platform === 'win32' && cmd === 'npm') cmd = 'npm.cmd';
+  const result = execFileSync(cmd, args, { cwd: root, encoding: 'utf8', ...opts });
   return typeof result === 'string' ? result.trim() : result;
 }
 
