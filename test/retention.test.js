@@ -142,6 +142,40 @@ test('directories belonging to a different vault name are never touched', async 
   }
 });
 
+test('deleting a stale backup asks fs.rm to retry on transient errors (EBUSY/ENOTEMPTY from an AV/indexer/sync client on a network drive)', async () => {
+  const dir = await mkTmpDir();
+  try {
+    const older = await makeBackupDir(dir, 'Vault', [2024, 1, 1, 20, 0]);
+    await makeBackupDir(dir, 'Vault', [2024, 1, 2, 20, 0]);
+
+    const fs = require('fs');
+    const realRm = fs.promises.rm;
+    let capturedOpts = null;
+    fs.promises.rm = (p, opts) => {
+      capturedOpts = opts;
+      return realRm(p, opts);
+    };
+
+    let deleted;
+    try {
+      const run = makeRun(dir, { keepDaily: 1 });
+      deleted = await run.applyRetention('Vault-');
+    } finally {
+      fs.promises.rm = realRm;
+    }
+
+    assert.deepEqual(deleted, [older]);
+    // Without maxRetries, fs.rm never retries a recursive delete on ENOTEMPTY/EBUSY/EPERM,
+    // so a single transient lock (e.g. AV briefly holding a file open on a network drive)
+    // aborts the delete partway through -- removing the completion marker but leaving the
+    // rest of the folder behind, which then hides it from every future retention run.
+    assert.ok(capturedOpts && capturedOpts.maxRetries >= 1, 'fs.rm must be called with maxRetries so transient locks are retried instead of aborting the delete');
+    assert.ok(capturedOpts && capturedOpts.retryDelay >= 1, 'fs.rm must be called with a retryDelay backoff between retries');
+  } finally {
+    await rmDir(dir);
+  }
+});
+
 test('a long history is pruned to exactly the daily+weekly+monthly union, nothing more nothing less', async () => {
   const dir = await mkTmpDir();
   try {
