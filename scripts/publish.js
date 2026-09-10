@@ -23,7 +23,11 @@ function readJson(file) {
 }
 
 function sh(cmd, args, opts = {}) {
-  return execFileSync(cmd, args, { cwd: root, encoding: 'utf8', ...opts }).trim();
+  // On Windows, npm/gh are .cmd/.ps1 shims that execFileSync can't exec
+  // directly without a shell.
+  const shell = process.platform === 'win32';
+  const result = execFileSync(cmd, args, { cwd: root, encoding: 'utf8', shell, ...opts });
+  return typeof result === 'string' ? result.trim() : result;
 }
 
 function fail(message) {
