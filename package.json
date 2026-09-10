@@ -5,7 +5,11 @@
   "description": "Backs up the vault to a folder of your choice, versioned by date and time, with automatic daily/weekly/monthly retention.",
   "main": "main.js",
   "scripts": {
+    "build": "node build.js",
     "test": "node --test"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
 }
