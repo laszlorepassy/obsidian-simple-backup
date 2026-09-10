@@ -334,6 +334,13 @@ class SimpleBackupSettingTab extends PluginSettingTab {
         cls: 'setting-item-description',
       });
     }
+
+    new Setting(containerEl)
+      .addButton((btn) => btn
+        .setButtonText('🍪 Buy me a cookie')
+        .onClick(() => {
+          window.open('https://paypal.me/repassyl', '_blank');
+        }));
   }
 }
 
