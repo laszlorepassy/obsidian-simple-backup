@@ -6,7 +6,8 @@
   "main": "main.js",
   "scripts": {
     "build": "node build.js",
-    "test": "node --test"
+    "test": "node --test",
+    "release": "node scripts/publish.js"
   },
   "license": "MIT",
   "devDependencies": {
