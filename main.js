@@ -217,7 +217,7 @@ var require_backup_core = __commonJS({
         for (const b of backups) {
           if (!keep.has(b.name)) {
             try {
-              await fsp2.rm(path2.join(this.targetRoot, b.name), { recursive: true, force: true });
+              await fsp2.rm(path2.join(this.targetRoot, b.name), { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
               deleted.push(b.name);
             } catch (err) {
               this.stats.errors.push(path2.join(this.targetRoot, b.name) + "  ->  " + err.message);

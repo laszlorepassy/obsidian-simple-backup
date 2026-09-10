@@ -226,7 +226,13 @@ class BackupRun {
     for (const b of backups) {
       if (!keep.has(b.name)) {
         try {
-          await fsp.rm(path.join(this.targetRoot, b.name), { recursive: true, force: true });
+          // maxRetries/retryDelay make fs.rm retry on ENOTEMPTY/EBUSY/EPERM: on
+          // network drives an AV/indexer/sync client can transiently hold a file
+          // open mid-delete, and without retries the recursive delete aborts
+          // partway -- removing the completion marker but leaving the rest of
+          // the tree behind, which then hides the leftover folder from every
+          // future retention run.
+          await fsp.rm(path.join(this.targetRoot, b.name), { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
           deleted.push(b.name);
         } catch (err) {
           this.stats.errors.push(path.join(this.targetRoot, b.name) + '  ->  ' + err.message);
