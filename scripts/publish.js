@@ -132,10 +132,15 @@ sh('git', ['push', 'origin', version], { stdio: 'inherit' });
 
 step('Creating GitHub release');
 
-// Use the "Bump to X: ..." commit subject as release notes when the tagged
-// commit follows that convention; otherwise let gh generate notes.
-const subject = sh('git', ['log', '-1', '--format=%s']);
-const bumpMatch = subject.match(new RegExp(`^Bump to ${version.replace(/\./g, '\\.')}:\\s*(.+)$`));
+// Use the "Bump to X: ..." commit subject as release notes when one exists
+// for this version (it needn't be HEAD — other commits may have landed on
+// top of the bump before this release was cut); otherwise let gh generate
+// notes from the commit range.
+const bumpSubject = sh('git', [
+  'log', '-1', '--format=%s',
+  `--grep=^Bump to ${version.replace(/\./g, '\\.')}:`,
+]);
+const bumpMatch = bumpSubject.match(new RegExp(`^Bump to ${version.replace(/\./g, '\\.')}:\\s*(.+)$`));
 
 const assets = ['manifest.json', 'main.js'];
 if (fs.existsSync(path.join(root, 'styles.css'))) {
