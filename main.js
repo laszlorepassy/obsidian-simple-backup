@@ -313,17 +313,72 @@ var require_backup_core = __commonJS({
   }
 });
 
+// src/wake-lock.js
+var require_wake_lock = __commonJS({
+  "src/wake-lock.js"(exports2, module2) {
+    "use strict";
+    var ScreenWakeLock2 = class {
+      constructor() {
+        this.sentinel = null;
+        this.wanted = false;
+        this.onVisibilityChange = () => {
+          if (this.wanted && document.visibilityState === "visible") this.request();
+        };
+      }
+      async acquire() {
+        if (this.wanted) return;
+        this.wanted = true;
+        if (typeof document !== "undefined") {
+          document.addEventListener("visibilitychange", this.onVisibilityChange);
+        }
+        await this.request();
+      }
+      async release() {
+        if (!this.wanted) return;
+        this.wanted = false;
+        if (typeof document !== "undefined") {
+          document.removeEventListener("visibilitychange", this.onVisibilityChange);
+        }
+        const sentinel = this.sentinel;
+        this.sentinel = null;
+        try {
+          if (sentinel) await sentinel.release();
+        } catch (err) {
+        }
+      }
+      async request() {
+        if (this.sentinel && !this.sentinel.released) return;
+        if (typeof navigator === "undefined" || !navigator.wakeLock) return;
+        try {
+          const sentinel = await navigator.wakeLock.request("screen");
+          if (!this.wanted) {
+            await sentinel.release();
+            return;
+          }
+          this.sentinel = sentinel;
+        } catch (err) {
+          console.debug("Simple Backup: could not keep the screen on during the backup", err);
+        }
+      }
+    };
+    module2.exports = { ScreenWakeLock: ScreenWakeLock2 };
+  }
+});
+
 // src/main.js
 var { Plugin, PluginSettingTab, Setting, Notice } = require("obsidian");
 var path = require("path");
 var fs = require("fs");
 var fsp = fs.promises;
 var { DEFAULT_SETTINGS, humanSize, BackupRun, dailyScheduleDecision } = require_backup_core();
+var { ScreenWakeLock } = require_wake_lock();
 var SimpleBackupPlugin = class extends Plugin {
   async onload() {
     await this.loadSettings();
     this.isRunning = false;
     this.activeNotice = null;
+    this.wakeLock = new ScreenWakeLock();
+    this.register(() => this.wakeLock.release());
     this.addRibbonIcon("archive", "Back up vault now", () => {
       this.runBackup({ trigger: "manual" });
     });
@@ -439,6 +494,7 @@ var SimpleBackupPlugin = class extends Plugin {
         }
       }
     });
+    this.wakeLock.acquire();
     try {
       const result = await run.run();
       this.isRunning = false;
@@ -479,6 +535,8 @@ ${message}
         }
       } catch (e) {
       }
+    } finally {
+      this.wakeLock.release();
     }
   }
   async loadSettings() {
