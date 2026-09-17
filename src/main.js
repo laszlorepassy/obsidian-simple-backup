@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
 const { DEFAULT_SETTINGS, humanSize, BackupRun, dailyScheduleDecision } = require('../backup-core');
+const { ScreenWakeLock } = require('./wake-lock');
 
 class SimpleBackupPlugin extends Plugin {
   async onload() {
@@ -12,6 +13,8 @@ class SimpleBackupPlugin extends Plugin {
 
     this.isRunning = false;
     this.activeNotice = null;
+    this.wakeLock = new ScreenWakeLock();
+    this.register(() => this.wakeLock.release());
 
     this.addRibbonIcon('archive', 'Back up vault now', () => {
       this.runBackup({ trigger: 'manual' });
@@ -148,6 +151,8 @@ class SimpleBackupPlugin extends Plugin {
       },
     });
 
+    // Released in the finally below, whichever way the run ends.
+    this.wakeLock.acquire();
     try {
       const result = await run.run();
       this.isRunning = false;
@@ -186,6 +191,8 @@ class SimpleBackupPlugin extends Plugin {
           await fsp.appendFile(logFilePath, `=== ${new Date().toISOString()} ===\n${message}\n\n`, 'utf8');
         }
       } catch (e) { /* best effort */ }
+    } finally {
+      this.wakeLock.release();
     }
   }
 

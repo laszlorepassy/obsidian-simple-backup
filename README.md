@@ -24,6 +24,7 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
   - Hourly
   - Daily, at a configurable time
 - **Live progress notice**: a small, single, continuously-updating notification shows roughly how far the current backup has gotten (files copied, size so far).
+- **Stays awake while backing up**: the computer won't go to sleep in the middle of a backup (Obsidian asks the system to keep the screen on for as long as the copy runs, then lets go). If the system refuses, the backup simply runs as before.
 - **Retention/rotation**: configurable number of daily/weekly/monthly snapshots to keep; everything else gets deleted automatically at the end of each run.
 - **Folder picker**: a native "Browse…" button next to the target directory field (uses Electron's dialog on desktop).
 - **Configurable exclude list** for files/folders that shouldn't be copied.

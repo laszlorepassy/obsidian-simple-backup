@@ -5,6 +5,7 @@ class Plugin {
   addCommand() {}
   addSettingTab() {}
   registerInterval() {}
+  register() {}
 }
 class PluginSettingTab {
   constructor(app, plugin) { this.app = app; this.plugin = plugin; }
