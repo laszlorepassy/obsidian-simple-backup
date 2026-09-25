@@ -4,7 +4,9 @@ const { Plugin, PluginSettingTab, Setting, Notice } = require('obsidian');
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
-const { DEFAULT_SETTINGS, humanSize, BackupRun, dailyScheduleDecision } = require('../backup-core');
+const {
+  DEFAULT_SETTINGS, humanSize, BackupRun, dailyScheduleDecision, localDateKey, normalizeDailyTime, targetLocation,
+} = require('../backup-core');
 const { ScreenWakeLock } = require('./wake-lock');
 
 class SimpleBackupPlugin extends Plugin {
@@ -13,6 +15,8 @@ class SimpleBackupPlugin extends Plugin {
 
     this.isRunning = false;
     this.activeNotice = null;
+    this.dailyRetry = null; // { date, failures, lastAttempt } for today's failed daily backups
+    this.warnedAboutTarget = false;
     this.wakeLock = new ScreenWakeLock();
     this.register(() => this.wakeLock.release());
 
@@ -45,14 +49,41 @@ class SimpleBackupPlugin extends Plugin {
     }, 60 * 1000));
   }
 
-  checkDailySchedule() {
-    const decision = dailyScheduleDecision(this.settings, new Date());
+  async checkDailySchedule() {
+    const now = new Date();
+    const decision = dailyScheduleDecision(this.settings, now, this.dailyRetry);
     if (decision.lastDailyRunDate !== this.settings.lastDailyRunDate) {
       this.settings.lastDailyRunDate = decision.lastDailyRunDate;
-      this.saveSettings();
+      await this.saveSettings();
     }
-    if (decision.run) {
-      this.runBackup({ trigger: 'daily' });
+    if (!decision.run) return;
+
+    const today = localDateKey(now);
+    const outcome = await this.runBackup({ trigger: 'daily' });
+    if (outcome === 'ok' || outcome === 'misconfigured') {
+      // Retrying won't fix a settings problem; its notice shows once a day, not every half hour.
+      this.settings.lastDailyRunDate = today;
+      await this.saveSettings();
+    } else if (outcome === 'failed') {
+      const failures = this.dailyRetry && this.dailyRetry.date === today ? this.dailyRetry.failures : 0;
+      this.dailyRetry = { date: today, failures: failures + 1, lastAttempt: Date.now() };
+    }
+    // 'busy': another backup is running; if it succeeds, it counts for today.
+  }
+
+  /** A warning about where the target folder is, or null if it's fine. */
+  targetWarning(targetDir) {
+    const basePath = this.getVaultBasePath();
+    if (!basePath || !targetDir) return null;
+    switch (targetLocation(targetDir, basePath)) {
+      case 'vault-root':
+        return 'The target directory cannot be the vault itself — pick a folder outside the vault.';
+      case 'visible-in-vault':
+        return 'This folder is inside the vault, so Obsidian indexes every snapshot as more notes '
+          + '(duplicates in search, the graph and the quick switcher). Pick a folder outside the vault, '
+          + 'or a hidden one whose name starts with a dot (e.g. .backups).';
+      default:
+        return null;
     }
   }
 
@@ -102,27 +133,34 @@ class SimpleBackupPlugin extends Plugin {
     }
   }
 
+  /** Resolves to 'ok', 'failed', 'busy' (another backup is running) or 'misconfigured'. */
   async runBackup({ trigger } = {}) {
     if (this.isRunning) {
-      new Notice('A backup is already in progress.');
-      return;
+      // Scheduled triggers colliding with each other shouldn't pop up a notice.
+      if (trigger === 'manual') new Notice('A backup is already in progress.');
+      return 'busy';
     }
 
     const basePath = this.getVaultBasePath();
     if (!basePath) {
       new Notice('Error: could not determine the vault path (this plugin only works in desktop Obsidian).');
-      return;
+      return 'misconfigured';
     }
 
     const targetDir = (this.settings.targetDir || '').trim();
     if (!targetDir) {
       new Notice('Error: no backup target directory set. Open the plugin settings.');
-      return;
+      return 'misconfigured';
     }
 
-    if (path.resolve(targetDir) === path.resolve(basePath)) {
-      new Notice('Error: the target directory cannot be the vault itself — pick (or create) a subfolder or a separate location.');
-      return;
+    const location = targetLocation(targetDir, basePath);
+    if (location === 'vault-root') {
+      new Notice('Error: ' + this.targetWarning(targetDir));
+      return 'misconfigured';
+    }
+    if (location === 'visible-in-vault' && !this.warnedAboutTarget) {
+      this.warnedAboutTarget = true;
+      new Notice('Simple Backup: ' + this.targetWarning(targetDir), 15000);
     }
 
     const vaultName = this.app.vault.getName();
@@ -153,8 +191,9 @@ class SimpleBackupPlugin extends Plugin {
 
     // Released in the finally below, whichever way the run ends.
     this.wakeLock.acquire();
+    let result;
     try {
-      const result = await run.run();
+      result = await run.run();
       this.isRunning = false;
       if (this.activeNotice) {
         const notice = this.activeNotice;
@@ -166,15 +205,6 @@ class SimpleBackupPlugin extends Plugin {
         setTimeout(() => notice.hide(), 4000);
         this.activeNotice = null;
       }
-      this.settings.lastRun = {
-        time: Date.now(),
-        trigger,
-        files: result.files,
-        bytes: result.bytes,
-        errors: result.errors.length,
-        deleted: result.deleted.length,
-      };
-      await this.saveSettings();
     } catch (err) {
       this.isRunning = false;
       const message = err && err.message ? err.message : String(err);
@@ -186,18 +216,39 @@ class SimpleBackupPlugin extends Plugin {
         this.activeNotice = null;
       }
       try {
-        if (logFilePath) {
+        // BackupRun logs the errors it hit itself; only log the ones it never saw.
+        if (logFilePath && !(err && err.logged)) {
           await fsp.mkdir(path.dirname(logFilePath), { recursive: true });
           await fsp.appendFile(logFilePath, `=== ${new Date().toISOString()} ===\n${message}\n\n`, 'utf8');
         }
       } catch (e) { /* best effort */ }
+      return 'failed';
     } finally {
       this.wakeLock.release();
     }
+
+    // Outside the try above: failing to save settings doesn't make a finished
+    // backup a failed one.
+    this.settings.lastRun = {
+      time: Date.now(),
+      trigger,
+      files: result.files,
+      bytes: result.bytes,
+      errors: result.errors.length,
+      deleted: result.deleted.length,
+    };
+    try {
+      await this.saveSettings();
+    } catch (err) {
+      console.error('Simple Backup: could not save settings', err);
+    }
+    return 'ok';
   }
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    // Older versions accepted times like "24:00" that never fire.
+    this.settings.dailyTime = normalizeDailyTime(this.settings.dailyTime) || DEFAULT_SETTINGS.dailyTime;
   }
 
   async saveSettings() {
@@ -227,6 +278,7 @@ class SimpleBackupSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.targetDir = value.trim();
             await this.plugin.saveSettings();
+            updateTargetWarning();
           });
         text.inputEl.style.width = '100%';
       })
@@ -240,6 +292,15 @@ class SimpleBackupSettingTab extends PluginSettingTab {
             this.display();
           }
         }));
+
+    const targetWarningEl = containerEl.createEl('p', { cls: 'setting-item-description' });
+    targetWarningEl.style.color = 'var(--text-warning)';
+    const updateTargetWarning = () => {
+      const warning = this.plugin.targetWarning(this.plugin.settings.targetDir);
+      targetWarningEl.setText(warning || '');
+      targetWarningEl.style.display = warning ? '' : 'none';
+    };
+    updateTargetWarning();
 
     new Setting(containerEl)
       .setName('Run on startup')
@@ -257,17 +318,19 @@ class SimpleBackupSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Run daily')
-      .setDesc('Run a backup once a day at the given time (HH:MM, local time).')
+      .setDesc('Run a backup once a day at the given time (HH:MM, local time). If it fails, e.g. because the target drive isn\'t connected, it is retried every 30 minutes, up to 3 times.')
       .addToggle((t) => t
         .setValue(this.plugin.settings.runDaily)
         .onChange(async (v) => { this.plugin.settings.runDaily = v; await this.plugin.saveSettings(); }))
       .addText((text) => text
-        .setPlaceholder('03:00')
+        .setPlaceholder('20:00')
         .setValue(this.plugin.settings.dailyTime)
         .onChange(async (v) => {
-          const trimmed = v.trim();
-          if (/^\d{2}:\d{2}$/.test(trimmed)) {
-            this.plugin.settings.dailyTime = trimmed;
+          const time = normalizeDailyTime(v);
+          // An invalid time is flagged and not saved; the last valid one stays in effect.
+          text.inputEl.style.borderColor = time ? '' : 'var(--text-error)';
+          if (time) {
+            this.plugin.settings.dailyTime = time;
             await this.plugin.saveSettings();
           }
         }));

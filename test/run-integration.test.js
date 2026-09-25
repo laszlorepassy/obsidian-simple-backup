@@ -100,3 +100,83 @@ test('a real run() prunes a pre-existing older backup once keepDaily is exceeded
 async function fileExists(p) {
   try { await fsp.access(p); return true; } catch { return false; }
 }
+
+test('a folder the target cannot create costs only that folder, not the whole backup', async () => {
+  const root = await mkTmpDir();
+  const realMkdir = fsp.mkdir;
+  try {
+    const source = path.join(root, 'vault');
+    const target = path.join(root, 'target');
+    await makeFakeVault(source);
+    await fsp.mkdir(path.join(source, 'bad?name'));
+    await fsp.writeFile(path.join(source, 'bad?name', 'x.md'), 'x', 'utf8');
+
+    // Simulate an NTFS/exFAT/SMB target that rejects '?' in names.
+    fsp.mkdir = async (p, o) => {
+      if (path.basename(p) === 'bad?name') throw Object.assign(new Error('EINVAL: invalid argument'), { code: 'EINVAL' });
+      return realMkdir(p, o);
+    };
+    const result = await new BackupRun({
+      sourceDir: source, targetRoot: target, vaultName: 'Vault', exclude: ['node_modules'],
+      logFilePath: path.join(root, 'backup-errors.log'),
+    }).run();
+    fsp.mkdir = realMkdir;
+
+    assert.equal(result.errors.length, 1);
+    assert.match(result.errors[0], /bad\?name/);
+    assert.ok(await fileExists(path.join(result.target, 'note.md')));
+    assert.ok(await fileExists(path.join(result.target, 'sub', 'inner.md')));
+    assert.ok(await fileExists(path.join(result.target, COMPLETE_MARKER)));
+  } finally {
+    fsp.mkdir = realMkdir;
+    await rmDir(root);
+  }
+});
+
+test('a target inside the vault is never copied into its own snapshot, even when reached by a different path', async (t) => {
+  const root = await mkTmpDir();
+  try {
+    const source = path.join(root, 'vault');
+    await makeFakeVault(source);
+    await fsp.mkdir(path.join(source, '.backups'));
+    // The user typed the target through a symlink, so the path differs from
+    // the folder copyTree walks into -- like a differently-cased path on Windows.
+    try {
+      await fsp.symlink(path.join(source, '.backups'), path.join(root, 'link'), 'dir');
+    } catch (e) {
+      t.skip('cannot create symlinks here');
+      return;
+    }
+    const target = path.join(root, 'link');
+
+    for (let i = 0; i < 2; i++) {
+      const run = new BackupRun({ sourceDir: source, targetRoot: target, vaultName: i ? 'Second' : 'First', exclude: ['node_modules'] });
+      const result = await run.run();
+      assert.equal(result.files, 2);
+      assert.ok(!(await fileExists(path.join(result.target, '.backups'))));
+    }
+  } finally {
+    await rmDir(root);
+  }
+});
+
+test('a run that aborts still writes the errors it collected to the log', async () => {
+  const root = await mkTmpDir();
+  try {
+    const source = path.join(root, 'vault');
+    const target = path.join(root, 'target');
+    const logFilePath = path.join(root, 'backup-errors.log');
+    await makeFakeVault(source);
+
+    const run = new BackupRun({ sourceDir: source, targetRoot: target, vaultName: 'Vault', exclude: [], logFilePath });
+    run.stats.errors.push('earlier file error');
+    run.applyRetention = async () => { throw new Error('boom'); };
+
+    await assert.rejects(() => run.run(), (err) => err.message === 'boom' && err.logged === true);
+    const log = await fsp.readFile(logFilePath, 'utf8');
+    assert.match(log, /earlier file error/);
+    assert.match(log, /Backup aborted: boom/);
+  } finally {
+    await rmDir(root);
+  }
+});

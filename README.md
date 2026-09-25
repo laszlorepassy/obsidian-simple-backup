@@ -22,9 +22,10 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 - **Scheduled triggers** (each independently toggleable):
   - On Obsidian startup
   - Hourly
-  - Daily, at a configurable time
+  - Daily, at a configurable time. If it fails (say, the target drive isn't plugged in), it's retried every 30 minutes, up to 3 times that day.
 - **Live progress notice**: a small, single, continuously-updating notification shows roughly how far the current backup has gotten (files copied, size so far).
-- **Stays awake while backing up**: the computer won't go to sleep in the middle of a backup (Obsidian asks the system to keep the screen on for as long as the copy runs, then lets go). If the system refuses, the backup simply runs as before.
+- **Stays awake while backing up**: the computer won't go to sleep in the middle of a backup, even with Obsidian minimized (the screen may still turn off). Where Obsidian doesn't expose the system's sleep blocker, it falls back to keeping the screen on, which only works while the window is visible. If the system refuses both, the backup simply runs as before.
+- **Big files on slow drives**: a file copy is only abandoned if it makes no progress at all for a minute, so large files on a slow network or USB drive are backed up no matter how long they take.
 - **Retention/rotation**: configurable number of daily/weekly/monthly snapshots to keep; everything else gets deleted automatically at the end of each run.
 - **Folder picker**: a native "Browse…" button next to the target directory field (uses Electron's dialog on desktop).
 - **Configurable exclude list** for files/folders that shouldn't be copied.
@@ -36,7 +37,7 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 | Target directory | Absolute path of the folder where dated backup snapshots are created. Required. |
 | Run on startup | Trigger a backup automatically whenever Obsidian opens the vault. |
 | Run hourly | Trigger a backup once per hour. |
-| Run daily | Trigger a backup once a day at a set `HH:MM` (local time). |
+| Run daily | Trigger a backup once a day at a set `HH:MM` (local time); failed runs are retried every 30 minutes, up to 3 times. |
 | Keep daily / weekly / monthly | How many most-recent daily/weekly/monthly snapshots to retain. |
 | Excluded files/folders | Comma-separated list of names to skip while copying (matched by exact name, not path). |
 
@@ -54,7 +55,8 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 
 - **No separate OS process.** An earlier version of this plugin ran the copy in a spawned child process at a lowered OS scheduling priority. In practice, Obsidian's Electron build silently ignores the standard mechanism for turning its own executable into a plain Node process (`ELECTRON_RUN_AS_NODE`), so the spawned "child" never actually ran the worker script — it just exited immediately. Rather than depend on that, the backup now runs inside Obsidian's own process using fully asynchronous I/O, which keeps the UI responsive without needing a second process at all. The trade-off is that the copy no longer gets a lowered OS priority of its own — in practice this is a non-issue, since copying is I/O-bound, not CPU-bound. It's also why there's no "run on shutdown" option: without a surviving separate process, a backup triggered on close could only ever be a best-effort race against Obsidian actually exiting, which isn't a promise worth making. Use "Run on startup" or a scheduled time instead.
 - **A backup interrupted mid-copy** (Obsidian closed before it finished, machine lost power, target drive disconnected) is left exactly as it is — it's never auto-deleted, but it's also excluded from the daily/weekly/monthly retention accounting, so it won't accidentally count as "the latest good snapshot" either. Clean it up manually if you find one (it has no `.backup-complete` marker file inside it).
-- **The target directory can't be the vault itself.** It can be a subfolder of the vault, or any other location — just not the vault's root path exactly.
+- **Keep the target directory outside the vault.** It can't be the vault itself. It can technically be a folder inside the vault, and it's then left out of its own snapshots, but Obsidian would index every snapshot as more notes (duplicates in search, the graph and the quick switcher) — so the settings show a warning, unless it's a hidden folder whose name starts with a dot (e.g. `.backups`), which Obsidian doesn't index.
+- **Folders or files the target can't hold** (e.g. names containing `:` or `?` when backing up from macOS/Linux to an NTFS, exFAT or SMB drive) are skipped and listed in `backup-errors.log`; the rest of the backup goes ahead.
 - **The "Browse…" folder picker** depends on Electron's `remote.dialog`, which isn't part of every Obsidian/Electron build. If it's unavailable, the button shows a notice and you can still type the path in by hand.
 
 ## Project layout

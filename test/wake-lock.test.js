@@ -81,3 +81,44 @@ test('does nothing where the API is missing or refuses', async () => {
     teardown();
   }
 });
+
+test('prefers Electron\'s powerSaveBlocker, which also works while the window is hidden', async () => {
+  const state = setup();
+  const calls = [];
+  const blocker = {
+    start: (type) => { calls.push(['start', type]); return 42; },
+    stop: (id) => calls.push(['stop', id]),
+  };
+  const lock = new ScreenWakeLock({ getPowerSaveBlocker: () => blocker });
+  await lock.acquire();
+  await lock.release();
+  assert.deepEqual(calls, [['start', 'prevent-app-suspension'], ['stop', 42]]);
+  assert.equal(state.requests, 0, 'no screen wake lock needed when the blocker works');
+  teardown();
+});
+
+test('falls back to the screen wake lock if powerSaveBlocker throws', async () => {
+  const state = setup();
+  const lock = new ScreenWakeLock({ getPowerSaveBlocker: () => ({ start() { throw new Error('no remote'); } }) });
+  await lock.acquire();
+  assert.equal(state.requests, 1);
+  await lock.release();
+  assert.equal(state.sentinels[0].releaseCalls, 1);
+  teardown();
+});
+
+test('overlapping requests never leave a second lock that nothing releases', async () => {
+  const state = setup();
+  const lock = new ScreenWakeLock();
+  // A backup that ends almost instantly, then the next one starting while the
+  // first lock request is still pending.
+  const first = lock.acquire();
+  await lock.release();
+  const second = lock.acquire();
+  state.listeners.forEach((l) => l()); // plus a visibilitychange for good measure
+  await Promise.all([first, second]);
+  await lock.release();
+  assert.equal(state.requests, 1);
+  assert.ok(state.sentinels.every((s) => s.releaseCalls === 1));
+  teardown();
+});

@@ -2,7 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { parseBackupDate, isoWeekKey, humanSize, stamp, pad } = require('../backup-core');
+const {
+  parseBackupDate, isoWeekKey, humanSize, stamp, pad, isSamePath, targetLocation, normalizeDailyTime,
+} = require('../backup-core');
 
 test('pad', () => {
   assert.equal(pad(3), '03');
@@ -54,4 +56,31 @@ test('humanSize formats byte counts', () => {
   assert.equal(humanSize(500), '500 B');
   assert.equal(humanSize(1536), '1.5 kB');
   assert.equal(humanSize(5 * 1024 * 1024), '5.0 MB');
+});
+
+test('isSamePath ignores case on Windows and macOS, not on Linux', () => {
+  assert.equal(isSamePath('d:\\vault\\backups', 'D:\\Vault\\Backups\\', 'win32'), true);
+  assert.equal(isSamePath('/Users/me/Vault', '/users/me/vault', 'darwin'), true);
+  assert.equal(isSamePath('/home/me/Vault', '/home/me/vault', 'linux'), false);
+});
+
+test('targetLocation tells apart outside, the vault root, and hidden/visible folders inside it', () => {
+  assert.equal(targetLocation('D:\\Backups', 'D:\\Vault', 'win32'), 'outside');
+  assert.equal(targetLocation('D:\\Vault-backups', 'D:\\Vault', 'win32'), 'outside');
+  assert.equal(targetLocation('d:\\vault\\', 'D:\\Vault', 'win32'), 'vault-root');
+  assert.equal(targetLocation('d:\\vault\\Backups', 'D:\\Vault', 'win32'), 'visible-in-vault');
+  assert.equal(targetLocation('D:\\Vault\\.backups\\obsidian', 'D:\\Vault', 'win32'), 'hidden-in-vault');
+  assert.equal(targetLocation('/home/me/Vault/..backup', '/home/me/Vault', 'linux'), 'hidden-in-vault');
+  assert.equal(targetLocation('/home/me', '/home/me/Vault', 'linux'), 'outside');
+});
+
+test('normalizeDailyTime accepts real times of day and rejects the rest', () => {
+  assert.equal(normalizeDailyTime('20:00'), '20:00');
+  assert.equal(normalizeDailyTime(' 9:05 '), '09:05');
+  assert.equal(normalizeDailyTime('23:59'), '23:59');
+  assert.equal(normalizeDailyTime('24:00'), null);
+  assert.equal(normalizeDailyTime('12:60'), null);
+  assert.equal(normalizeDailyTime('noon'), null);
+  assert.equal(normalizeDailyTime(''), null);
+  assert.equal(normalizeDailyTime(undefined), null);
 });

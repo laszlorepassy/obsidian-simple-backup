@@ -15,10 +15,14 @@ var require_backup_core = __commonJS({
     var path2 = require("path");
     var fs2 = require("fs");
     var fsp2 = fs2.promises;
+    var { pipeline } = require("stream/promises");
     var RETRIES = 3;
     var RETRY_WAIT_MS = 800;
     var COMPLETE_MARKER = ".backup-complete";
-    var COPY_TIMEOUT_MS = 60 * 1e3;
+    var COPY_STALL_TIMEOUT_MS = 60 * 1e3;
+    var COPY_CHUNK_BYTES = 1024 * 1024;
+    var DAILY_RETRY_DELAY_MS = 30 * 60 * 1e3;
+    var DAILY_MAX_RETRIES = 3;
     var DEFAULT_SETTINGS2 = {
       targetDir: "",
       runOnStartup: false,
@@ -52,12 +56,69 @@ var require_backup_core = __commonJS({
     function sleep(ms) {
       return new Promise((resolve) => setTimeout(resolve, ms));
     }
-    function withTimeout(promise, ms, label) {
+    function copyFileWithStallTimeout(src, dest, stallMs) {
+      const ac = new AbortController();
       let timer;
-      const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error("Timed out after " + ms + "ms: " + label)), ms);
+      const arm = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => ac.abort(), stallMs);
+      };
+      const rs = fs2.createReadStream(src, { highWaterMark: COPY_CHUNK_BYTES });
+      const ws = fs2.createWriteStream(dest, { flags: "wx" });
+      rs.on("data", arm);
+      arm();
+      const copying = pipeline(rs, ws, { signal: ac.signal });
+      const stalled = new Promise((_, reject) => {
+        ac.signal.addEventListener("abort", () => {
+          reject(new Error("No progress for " + Math.round(stallMs / 1e3) + "s, gave up: " + src));
+        });
       });
-      return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+      return Promise.race([copying, stalled]).then(
+        () => clearTimeout(timer),
+        (err) => {
+          clearTimeout(timer);
+          copying.catch(() => {
+          }).finally(() => fsp2.unlink(dest).catch(() => {
+          }));
+          throw err;
+        }
+      );
+    }
+    function pathApi(platform) {
+      return platform === "win32" ? path2.win32 : path2.posix;
+    }
+    function foldCase(p, platform) {
+      return platform === "win32" || platform === "darwin" ? p.toLowerCase() : p;
+    }
+    function isSamePath(a, b, platform) {
+      platform = platform || process.platform;
+      const api = pathApi(platform);
+      return foldCase(api.resolve(a), platform) === foldCase(api.resolve(b), platform);
+    }
+    function targetLocation2(targetDir, vaultDir, platform) {
+      platform = platform || process.platform;
+      const api = pathApi(platform);
+      const rel = api.relative(foldCase(api.resolve(vaultDir), platform), foldCase(api.resolve(targetDir), platform));
+      if (rel === "") return "vault-root";
+      if (rel === ".." || rel.startsWith(".." + api.sep) || api.isAbsolute(rel)) return "outside";
+      return rel.split(api.sep).some((seg) => seg.startsWith(".")) ? "hidden-in-vault" : "visible-in-vault";
+    }
+    async function fileIdentity(p) {
+      try {
+        const st = await fsp2.stat(p, { bigint: true });
+        if (!st.ino) return null;
+        return st.dev + ":" + st.ino;
+      } catch (e) {
+        return null;
+      }
+    }
+    function normalizeDailyTime2(value) {
+      const m = String(value == null ? "" : value).trim().match(/^(\d{1,2}):(\d{2})$/);
+      if (!m) return null;
+      const h = Number(m[1]);
+      const min = Number(m[2]);
+      if (h > 23 || min > 59) return null;
+      return pad(h) + ":" + pad(min);
     }
     function parseBackupDate(name, prefix) {
       const rest = name.slice(prefix.length);
@@ -81,27 +142,35 @@ var require_backup_core = __commonJS({
         return false;
       }
     }
+    function localDateKey2(d) {
+      return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+    }
     function isSameLocalDay(a, b) {
       return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
     }
-    function dailyScheduleDecision2(settings, now) {
-      if (!settings.runDaily) return { run: false, lastDailyRunDate: settings.lastDailyRunDate };
-      const today = now.getFullYear() + "-" + pad(now.getMonth() + 1) + "-" + pad(now.getDate());
-      if (settings.lastDailyRunDate === today) return { run: false, lastDailyRunDate: settings.lastDailyRunDate };
+    function dailyScheduleDecision2(settings, now, retry) {
+      const unchanged = { run: false, lastDailyRunDate: settings.lastDailyRunDate };
+      if (!settings.runDaily) return unchanged;
+      const today = localDateKey2(now);
+      if (settings.lastDailyRunDate === today) return unchanged;
       if (settings.lastRun && settings.lastRun.time && isSameLocalDay(new Date(settings.lastRun.time), now)) {
         return { run: false, lastDailyRunDate: today };
       }
+      const dailyTime = normalizeDailyTime2(settings.dailyTime) || DEFAULT_SETTINGS2.dailyTime;
       const hhmm = pad(now.getHours()) + ":" + pad(now.getMinutes());
-      if (hhmm >= settings.dailyTime) {
-        return { run: true, lastDailyRunDate: today };
+      if (hhmm < dailyTime) return unchanged;
+      if (retry && retry.date === today) {
+        if (retry.failures > DAILY_MAX_RETRIES) return unchanged;
+        if (now.getTime() - retry.lastAttempt < DAILY_RETRY_DELAY_MS) return unchanged;
       }
-      return { run: false, lastDailyRunDate: settings.lastDailyRunDate };
+      return { run: true, lastDailyRunDate: settings.lastDailyRunDate };
     }
     var BackupRun2 = class {
       constructor(opts) {
         this.sourceDir = opts.sourceDir;
         this.targetRoot = opts.targetRoot;
-        this.targetRootResolved = path2.resolve(opts.targetRoot);
+        this.platform = opts.platform || process.platform;
+        this.targetRootId = null;
         this.vaultName = opts.vaultName;
         this.exclude = new Set(opts.exclude || []);
         this.keepDaily = Number.isFinite(opts.keepDaily) ? opts.keepDaily : 7;
@@ -110,8 +179,23 @@ var require_backup_core = __commonJS({
         this.logFilePath = opts.logFilePath;
         this.onProgress = opts.onProgress || (() => {
         });
+        this.stallTimeoutMs = opts.stallTimeoutMs || COPY_STALL_TIMEOUT_MS;
         this.stats = { dirs: 0, files: 0, bytes: 0, skipped: 0, errors: [] };
         this.totalFiles = 0;
+      }
+      /**
+       * Whether dir is the backup target folder, so a target inside the vault
+       * isn't copied into its own snapshots. Compared by path (ignoring case where
+       * the OS does) and, where available, by dev+inode, which also catches the
+       * same folder reached through a symlink, junction or differently-typed path.
+       */
+      async isTargetRoot(dir) {
+        if (isSamePath(dir, this.targetRoot, this.platform)) return true;
+        if (!this.targetRootId) return false;
+        return await fileIdentity(dir) === this.targetRootId;
+      }
+      copyFileOnce(src, dest) {
+        return copyFileWithStallTimeout(src, dest, this.stallTimeoutMs);
       }
       async countFiles(dir) {
         let entries;
@@ -124,10 +208,10 @@ var require_backup_core = __commonJS({
         for (const entry of entries) {
           if (this.exclude.has(entry.name)) continue;
           const from = path2.join(dir, entry.name);
-          if (path2.resolve(from) === this.targetRootResolved) continue;
           if (entry.isSymbolicLink()) continue;
-          if (entry.isDirectory()) count += await this.countFiles(from);
-          else if (entry.isFile()) count++;
+          if (entry.isDirectory()) {
+            if (!await this.isTargetRoot(from)) count += await this.countFiles(from);
+          } else if (entry.isFile()) count++;
         }
         return count;
       }
@@ -135,9 +219,10 @@ var require_backup_core = __commonJS({
         for (let attempt = 1; ; attempt++) {
           const tmpDest = dest + ".tmp-" + process.pid + "-" + Date.now() + "-" + attempt;
           try {
-            await withTimeout(fsp2.copyFile(src, tmpDest), COPY_TIMEOUT_MS, src);
+            await this.copyFileOnce(src, tmpDest);
             try {
               const st = await fsp2.stat(src);
+              await fsp2.chmod(tmpDest, st.mode);
               await fsp2.utimes(tmpDest, st.atime, st.mtime);
             } catch (e) {
             }
@@ -166,7 +251,12 @@ var require_backup_core = __commonJS({
           this.stats.errors.push(srcDir + "  ->  " + err.message);
           return;
         }
-        await fsp2.mkdir(destDir, { recursive: true });
+        try {
+          await fsp2.mkdir(destDir, { recursive: true });
+        } catch (err) {
+          this.stats.errors.push(srcDir + "  ->  " + err.message);
+          return;
+        }
         this.stats.dirs++;
         for (const entry of entries) {
           if (this.exclude.has(entry.name)) {
@@ -175,10 +265,6 @@ var require_backup_core = __commonJS({
           }
           const from = path2.join(srcDir, entry.name);
           const to = path2.join(destDir, entry.name);
-          if (path2.resolve(from) === this.targetRootResolved) {
-            this.stats.skipped++;
-            continue;
-          }
           if (entry.isSymbolicLink()) {
             try {
               await fsp2.symlink(await fsp2.readlink(from), to);
@@ -188,6 +274,10 @@ var require_backup_core = __commonJS({
             continue;
           }
           if (entry.isDirectory()) {
+            if (await this.isTargetRoot(from)) {
+              this.stats.skipped++;
+              continue;
+            }
             await this.copyTree(from, to);
             continue;
           }
@@ -265,21 +355,30 @@ var require_backup_core = __commonJS({
         if (!await pathExists(this.sourceDir)) {
           throw new Error("The source vault folder was not found: " + this.sourceDir);
         }
-        await fsp2.mkdir(this.targetRoot, { recursive: true });
         const prefix = this.vaultName + "-";
         const target = path2.join(this.targetRoot, prefix + stamp());
-        if (await pathExists(target)) {
-          throw new Error("The target folder already exists: " + target);
-        }
-        this.totalFiles = await this.countFiles(this.sourceDir);
-        this.onProgress({ files: 0, total: this.totalFiles, bytes: 0 });
-        await this.copyTree(this.sourceDir, target);
+        let deleted;
         try {
-          await fsp2.writeFile(path2.join(target, COMPLETE_MARKER), (/* @__PURE__ */ new Date()).toISOString(), "utf8");
+          await fsp2.mkdir(this.targetRoot, { recursive: true });
+          this.targetRootId = await fileIdentity(this.targetRoot);
+          if (await pathExists(target)) {
+            throw new Error("The target folder already exists: " + target);
+          }
+          this.totalFiles = await this.countFiles(this.sourceDir);
+          this.onProgress({ files: 0, total: this.totalFiles, bytes: 0 });
+          await this.copyTree(this.sourceDir, target);
+          try {
+            await fsp2.writeFile(path2.join(target, COMPLETE_MARKER), (/* @__PURE__ */ new Date()).toISOString(), "utf8");
+          } catch (err) {
+            this.stats.errors.push(target + "  ->  could not write completion marker: " + err.message);
+          }
+          deleted = await this.applyRetention(prefix);
         } catch (err) {
-          this.stats.errors.push(target + "  ->  could not write completion marker: " + err.message);
+          this.stats.errors.push("Backup aborted: " + err.message);
+          await this.writeErrorLog(target);
+          err.logged = true;
+          throw err;
         }
-        const deleted = await this.applyRetention(prefix);
         await this.writeErrorLog(target);
         return {
           files: this.stats.files,
@@ -296,16 +395,23 @@ var require_backup_core = __commonJS({
       RETRIES,
       RETRY_WAIT_MS,
       COMPLETE_MARKER,
-      COPY_TIMEOUT_MS,
+      COPY_STALL_TIMEOUT_MS,
+      DAILY_RETRY_DELAY_MS,
+      DAILY_MAX_RETRIES,
       DEFAULT_SETTINGS: DEFAULT_SETTINGS2,
       pad,
       stamp,
       humanSize: humanSize2,
       sleep,
-      withTimeout,
+      copyFileWithStallTimeout,
+      isSamePath,
+      targetLocation: targetLocation2,
+      fileIdentity,
+      normalizeDailyTime: normalizeDailyTime2,
       parseBackupDate,
       isoWeekKey,
       pathExists,
+      localDateKey: localDateKey2,
       isSameLocalDay,
       dailyScheduleDecision: dailyScheduleDecision2,
       BackupRun: BackupRun2
@@ -317,9 +423,21 @@ var require_backup_core = __commonJS({
 var require_wake_lock = __commonJS({
   "src/wake-lock.js"(exports2, module2) {
     "use strict";
+    function defaultPowerSaveBlocker() {
+      try {
+        const remote = require("electron").remote;
+        return remote && remote.powerSaveBlocker ? remote.powerSaveBlocker : null;
+      } catch (err) {
+        return null;
+      }
+    }
     var ScreenWakeLock2 = class {
-      constructor() {
+      constructor(opts = {}) {
+        this.getPowerSaveBlocker = opts.getPowerSaveBlocker || defaultPowerSaveBlocker;
+        this.blocker = null;
+        this.blockerId = null;
         this.sentinel = null;
+        this.pending = null;
         this.wanted = false;
         this.onVisibilityChange = () => {
           if (this.wanted && document.visibilityState === "visible") this.request();
@@ -328,6 +446,7 @@ var require_wake_lock = __commonJS({
       async acquire() {
         if (this.wanted) return;
         this.wanted = true;
+        if (this.startBlocker()) return;
         if (typeof document !== "undefined") {
           document.addEventListener("visibilitychange", this.onVisibilityChange);
         }
@@ -336,6 +455,14 @@ var require_wake_lock = __commonJS({
       async release() {
         if (!this.wanted) return;
         this.wanted = false;
+        if (this.blocker) {
+          try {
+            this.blocker.stop(this.blockerId);
+          } catch (err) {
+          }
+          this.blocker = null;
+          this.blockerId = null;
+        }
         if (typeof document !== "undefined") {
           document.removeEventListener("visibilitychange", this.onVisibilityChange);
         }
@@ -346,19 +473,36 @@ var require_wake_lock = __commonJS({
         } catch (err) {
         }
       }
-      async request() {
-        if (this.sentinel && !this.sentinel.released) return;
-        if (typeof navigator === "undefined" || !navigator.wakeLock) return;
+      startBlocker() {
         try {
-          const sentinel = await navigator.wakeLock.request("screen");
-          if (!this.wanted) {
-            await sentinel.release();
-            return;
-          }
-          this.sentinel = sentinel;
+          const blocker = this.getPowerSaveBlocker();
+          if (!blocker) return false;
+          this.blockerId = blocker.start("prevent-app-suspension");
+          this.blocker = blocker;
+          return true;
         } catch (err) {
-          console.debug("Simple Backup: could not keep the screen on during the backup", err);
+          return false;
         }
+      }
+      request() {
+        if (this.pending) return this.pending;
+        if (this.sentinel && !this.sentinel.released) return Promise.resolve();
+        if (typeof navigator === "undefined" || !navigator.wakeLock) return Promise.resolve();
+        this.pending = (async () => {
+          try {
+            const sentinel = await navigator.wakeLock.request("screen");
+            if (!this.wanted) {
+              await sentinel.release();
+              return;
+            }
+            this.sentinel = sentinel;
+          } catch (err) {
+            console.debug("Simple Backup: could not keep the computer awake during the backup", err);
+          } finally {
+            this.pending = null;
+          }
+        })();
+        return this.pending;
       }
     };
     module2.exports = { ScreenWakeLock: ScreenWakeLock2 };
@@ -370,13 +514,23 @@ var { Plugin, PluginSettingTab, Setting, Notice } = require("obsidian");
 var path = require("path");
 var fs = require("fs");
 var fsp = fs.promises;
-var { DEFAULT_SETTINGS, humanSize, BackupRun, dailyScheduleDecision } = require_backup_core();
+var {
+  DEFAULT_SETTINGS,
+  humanSize,
+  BackupRun,
+  dailyScheduleDecision,
+  localDateKey,
+  normalizeDailyTime,
+  targetLocation
+} = require_backup_core();
 var { ScreenWakeLock } = require_wake_lock();
 var SimpleBackupPlugin = class extends Plugin {
   async onload() {
     await this.loadSettings();
     this.isRunning = false;
     this.activeNotice = null;
+    this.dailyRetry = null;
+    this.warnedAboutTarget = false;
     this.wakeLock = new ScreenWakeLock();
     this.register(() => this.wakeLock.release());
     this.addRibbonIcon("archive", "Back up vault now", () => {
@@ -402,14 +556,35 @@ var SimpleBackupPlugin = class extends Plugin {
       this.checkDailySchedule();
     }, 60 * 1e3));
   }
-  checkDailySchedule() {
-    const decision = dailyScheduleDecision(this.settings, /* @__PURE__ */ new Date());
+  async checkDailySchedule() {
+    const now = /* @__PURE__ */ new Date();
+    const decision = dailyScheduleDecision(this.settings, now, this.dailyRetry);
     if (decision.lastDailyRunDate !== this.settings.lastDailyRunDate) {
       this.settings.lastDailyRunDate = decision.lastDailyRunDate;
-      this.saveSettings();
+      await this.saveSettings();
     }
-    if (decision.run) {
-      this.runBackup({ trigger: "daily" });
+    if (!decision.run) return;
+    const today = localDateKey(now);
+    const outcome = await this.runBackup({ trigger: "daily" });
+    if (outcome === "ok" || outcome === "misconfigured") {
+      this.settings.lastDailyRunDate = today;
+      await this.saveSettings();
+    } else if (outcome === "failed") {
+      const failures = this.dailyRetry && this.dailyRetry.date === today ? this.dailyRetry.failures : 0;
+      this.dailyRetry = { date: today, failures: failures + 1, lastAttempt: Date.now() };
+    }
+  }
+  /** A warning about where the target folder is, or null if it's fine. */
+  targetWarning(targetDir) {
+    const basePath = this.getVaultBasePath();
+    if (!basePath || !targetDir) return null;
+    switch (targetLocation(targetDir, basePath)) {
+      case "vault-root":
+        return "The target directory cannot be the vault itself \u2014 pick a folder outside the vault.";
+      case "visible-in-vault":
+        return "This folder is inside the vault, so Obsidian indexes every snapshot as more notes (duplicates in search, the graph and the quick switcher). Pick a folder outside the vault, or a hidden one whose name starts with a dot (e.g. .backups).";
+      default:
+        return null;
     }
   }
   getVaultBasePath() {
@@ -452,24 +627,30 @@ var SimpleBackupPlugin = class extends Plugin {
       return null;
     }
   }
+  /** Resolves to 'ok', 'failed', 'busy' (another backup is running) or 'misconfigured'. */
   async runBackup({ trigger } = {}) {
     if (this.isRunning) {
-      new Notice("A backup is already in progress.");
-      return;
+      if (trigger === "manual") new Notice("A backup is already in progress.");
+      return "busy";
     }
     const basePath = this.getVaultBasePath();
     if (!basePath) {
       new Notice("Error: could not determine the vault path (this plugin only works in desktop Obsidian).");
-      return;
+      return "misconfigured";
     }
     const targetDir = (this.settings.targetDir || "").trim();
     if (!targetDir) {
       new Notice("Error: no backup target directory set. Open the plugin settings.");
-      return;
+      return "misconfigured";
     }
-    if (path.resolve(targetDir) === path.resolve(basePath)) {
-      new Notice("Error: the target directory cannot be the vault itself \u2014 pick (or create) a subfolder or a separate location.");
-      return;
+    const location = targetLocation(targetDir, basePath);
+    if (location === "vault-root") {
+      new Notice("Error: " + this.targetWarning(targetDir));
+      return "misconfigured";
+    }
+    if (location === "visible-in-vault" && !this.warnedAboutTarget) {
+      this.warnedAboutTarget = true;
+      new Notice("Simple Backup: " + this.targetWarning(targetDir), 15e3);
     }
     const vaultName = this.app.vault.getName();
     const logFilePath = this.getLogFilePath();
@@ -495,8 +676,9 @@ var SimpleBackupPlugin = class extends Plugin {
       }
     });
     this.wakeLock.acquire();
+    let result;
     try {
-      const result = await run.run();
+      result = await run.run();
       this.isRunning = false;
       if (this.activeNotice) {
         const notice = this.activeNotice;
@@ -506,15 +688,6 @@ var SimpleBackupPlugin = class extends Plugin {
         setTimeout(() => notice.hide(), 4e3);
         this.activeNotice = null;
       }
-      this.settings.lastRun = {
-        time: Date.now(),
-        trigger,
-        files: result.files,
-        bytes: result.bytes,
-        errors: result.errors.length,
-        deleted: result.deleted.length
-      };
-      await this.saveSettings();
     } catch (err) {
       this.isRunning = false;
       const message = err && err.message ? err.message : String(err);
@@ -526,7 +699,7 @@ var SimpleBackupPlugin = class extends Plugin {
         this.activeNotice = null;
       }
       try {
-        if (logFilePath) {
+        if (logFilePath && !(err && err.logged)) {
           await fsp.mkdir(path.dirname(logFilePath), { recursive: true });
           await fsp.appendFile(logFilePath, `=== ${(/* @__PURE__ */ new Date()).toISOString()} ===
 ${message}
@@ -535,12 +708,28 @@ ${message}
         }
       } catch (e) {
       }
+      return "failed";
     } finally {
       this.wakeLock.release();
     }
+    this.settings.lastRun = {
+      time: Date.now(),
+      trigger,
+      files: result.files,
+      bytes: result.bytes,
+      errors: result.errors.length,
+      deleted: result.deleted.length
+    };
+    try {
+      await this.saveSettings();
+    } catch (err) {
+      console.error("Simple Backup: could not save settings", err);
+    }
+    return "ok";
   }
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings.dailyTime = normalizeDailyTime(this.settings.dailyTime) || DEFAULT_SETTINGS.dailyTime;
   }
   async saveSettings() {
     await this.saveData(this.settings);
@@ -559,6 +748,7 @@ var SimpleBackupSettingTab = class extends PluginSettingTab {
       text.setPlaceholder("e.g. D:\\Backups\\Obsidian").setValue(this.plugin.settings.targetDir).onChange(async (value) => {
         this.plugin.settings.targetDir = value.trim();
         await this.plugin.saveSettings();
+        updateTargetWarning();
       });
       text.inputEl.style.width = "100%";
     }).addButton((btn) => btn.setButtonText("Browse\u2026").onClick(async () => {
@@ -569,6 +759,14 @@ var SimpleBackupSettingTab = class extends PluginSettingTab {
         this.display();
       }
     }));
+    const targetWarningEl = containerEl.createEl("p", { cls: "setting-item-description" });
+    targetWarningEl.style.color = "var(--text-warning)";
+    const updateTargetWarning = () => {
+      const warning = this.plugin.targetWarning(this.plugin.settings.targetDir);
+      targetWarningEl.setText(warning || "");
+      targetWarningEl.style.display = warning ? "" : "none";
+    };
+    updateTargetWarning();
     new Setting(containerEl).setName("Run on startup").setDesc("Automatically run a backup when Obsidian opens this vault.").addToggle((t) => t.setValue(this.plugin.settings.runOnStartup).onChange(async (v) => {
       this.plugin.settings.runOnStartup = v;
       await this.plugin.saveSettings();
@@ -577,13 +775,14 @@ var SimpleBackupSettingTab = class extends PluginSettingTab {
       this.plugin.settings.runHourly = v;
       await this.plugin.saveSettings();
     }));
-    new Setting(containerEl).setName("Run daily").setDesc("Run a backup once a day at the given time (HH:MM, local time).").addToggle((t) => t.setValue(this.plugin.settings.runDaily).onChange(async (v) => {
+    new Setting(containerEl).setName("Run daily").setDesc("Run a backup once a day at the given time (HH:MM, local time). If it fails, e.g. because the target drive isn't connected, it is retried every 30 minutes, up to 3 times.").addToggle((t) => t.setValue(this.plugin.settings.runDaily).onChange(async (v) => {
       this.plugin.settings.runDaily = v;
       await this.plugin.saveSettings();
-    })).addText((text) => text.setPlaceholder("03:00").setValue(this.plugin.settings.dailyTime).onChange(async (v) => {
-      const trimmed = v.trim();
-      if (/^\d{2}:\d{2}$/.test(trimmed)) {
-        this.plugin.settings.dailyTime = trimmed;
+    })).addText((text) => text.setPlaceholder("20:00").setValue(this.plugin.settings.dailyTime).onChange(async (v) => {
+      const time = normalizeDailyTime(v);
+      text.inputEl.style.borderColor = time ? "" : "var(--text-error)";
+      if (time) {
+        this.plugin.settings.dailyTime = time;
         await this.plugin.saveSettings();
       }
     }));

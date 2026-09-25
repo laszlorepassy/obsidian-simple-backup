@@ -3,11 +3,20 @@
 const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
+const { pipeline } = require('stream/promises');
 
 const RETRIES = 3;
 const RETRY_WAIT_MS = 800;
 const COMPLETE_MARKER = '.backup-complete';
-const COPY_TIMEOUT_MS = 60 * 1000;
+// How long a single file copy may go without moving a single byte before it's
+// considered hung. Not a limit on the whole copy: a multi-GB video on a slow
+// network drive can take many minutes, and that's fine as long as it progresses.
+const COPY_STALL_TIMEOUT_MS = 60 * 1000;
+const COPY_CHUNK_BYTES = 1024 * 1024;
+// After a failed daily backup (e.g. the target drive isn't plugged in), try
+// again this much later, at most DAILY_MAX_RETRIES times that day.
+const DAILY_RETRY_DELAY_MS = 30 * 60 * 1000;
+const DAILY_MAX_RETRIES = 3;
 
 const DEFAULT_SETTINGS = {
   targetDir: '',
@@ -43,12 +52,103 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function withTimeout(promise, ms, label) {
+/**
+ * Copies src to dest (which must not exist yet), failing if no data moves for
+ * stallMs. Unlike racing fsp.copyFile against a timer, a stalled copy is really
+ * cancelled: both streams are destroyed, so a retry never competes with a
+ * zombie copy of the same file. Reads pause while a slow write catches up
+ * (backpressure), so a hung target stalls the reads too and trips the timer.
+ */
+function copyFileWithStallTimeout(src, dest, stallMs) {
+  const ac = new AbortController();
   let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error('Timed out after ' + ms + 'ms: ' + label)), ms);
+  const arm = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => ac.abort(), stallMs);
+  };
+
+  const rs = fs.createReadStream(src, { highWaterMark: COPY_CHUNK_BYTES });
+  const ws = fs.createWriteStream(dest, { flags: 'wx' });
+  rs.on('data', arm);
+  arm();
+
+  const copying = pipeline(rs, ws, { signal: ac.signal });
+  // Don't wait for the pipeline to wind down after an abort: a write stuck in
+  // the OS may not return for a long time.
+  const stalled = new Promise((_, reject) => {
+    ac.signal.addEventListener('abort', () => {
+      reject(new Error('No progress for ' + Math.round(stallMs / 1000) + 's, gave up: ' + src));
+    });
   });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+
+  return Promise.race([copying, stalled]).then(
+    () => clearTimeout(timer),
+    (err) => {
+      clearTimeout(timer);
+      // The temp file may still be held open by the stuck write; remove it
+      // once the streams have actually let go of it.
+      copying.catch(() => {}).finally(() => fsp.unlink(dest).catch(() => {}));
+      throw err;
+    }
+  );
+}
+
+// Windows and macOS file systems are case-insensitive by default, so
+// "d:\vault\Backups" and "D:\Vault\backups" are the same folder there.
+function pathApi(platform) {
+  return platform === 'win32' ? path.win32 : path.posix;
+}
+
+function foldCase(p, platform) {
+  return platform === 'win32' || platform === 'darwin' ? p.toLowerCase() : p;
+}
+
+function isSamePath(a, b, platform) {
+  platform = platform || process.platform;
+  const api = pathApi(platform);
+  return foldCase(api.resolve(a), platform) === foldCase(api.resolve(b), platform);
+}
+
+/**
+ * Where the backup target sits relative to the vault:
+ *   'outside'        -- anywhere outside the vault (the normal case)
+ *   'vault-root'     -- the vault folder itself (refused)
+ *   'hidden-in-vault'-- inside the vault, under a dot-folder Obsidian doesn't index
+ *   'visible-in-vault' -- inside the vault where Obsidian indexes every snapshot
+ *                       as more notes (duplicates in search, graph, quick switcher)
+ */
+function targetLocation(targetDir, vaultDir, platform) {
+  platform = platform || process.platform;
+  const api = pathApi(platform);
+  const rel = api.relative(foldCase(api.resolve(vaultDir), platform), foldCase(api.resolve(targetDir), platform));
+  if (rel === '') return 'vault-root';
+  if (rel === '..' || rel.startsWith('..' + api.sep) || api.isAbsolute(rel)) return 'outside';
+  return rel.split(api.sep).some((seg) => seg.startsWith('.')) ? 'hidden-in-vault' : 'visible-in-vault';
+}
+
+/** dev+inode identity of a path, or null where the file system doesn't provide one. */
+async function fileIdentity(p) {
+  try {
+    const st = await fsp.stat(p, { bigint: true });
+    if (!st.ino) return null;
+    return st.dev + ':' + st.ino;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Normalizes a daily time typed by the user ("9:05", " 20:00 ") to "HH:MM",
+ * or returns null if it isn't a real time of day. The schedule compares
+ * times as strings, so e.g. "24:00" would otherwise silently never fire.
+ */
+function normalizeDailyTime(value) {
+  const m = String(value == null ? '' : value).trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  return pad(h) + ':' + pad(min);
 }
 
 function parseBackupDate(name, prefix) {
@@ -71,6 +171,10 @@ async function pathExists(p) {
   try { await fsp.access(p); return true; } catch (e) { return false; }
 }
 
+function localDateKey(d) {
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+}
+
 function isSameLocalDay(a, b) {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
@@ -85,23 +189,33 @@ function isSameLocalDay(a, b) {
  * a slow tick) doesn't skip the whole day. But if a backup from any trigger
  * (startup/manual/hourly) already completed today, that satisfies the daily
  * requirement instead of firing a second full backup.
+ *
+ * Firing doesn't mark the day as done: the caller records lastDailyRunDate
+ * only once the backup succeeds. A failed one (target drive not plugged in,
+ * say) is retried DAILY_RETRY_DELAY_MS later, up to DAILY_MAX_RETRIES times;
+ * `retry` is { date, failures, lastAttempt } for today's failed attempts.
  */
-function dailyScheduleDecision(settings, now) {
-  if (!settings.runDaily) return { run: false, lastDailyRunDate: settings.lastDailyRunDate };
+function dailyScheduleDecision(settings, now, retry) {
+  const unchanged = { run: false, lastDailyRunDate: settings.lastDailyRunDate };
+  if (!settings.runDaily) return unchanged;
 
-  const today = now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate());
-  if (settings.lastDailyRunDate === today) return { run: false, lastDailyRunDate: settings.lastDailyRunDate };
+  const today = localDateKey(now);
+  if (settings.lastDailyRunDate === today) return unchanged;
 
   if (settings.lastRun && settings.lastRun.time && isSameLocalDay(new Date(settings.lastRun.time), now)) {
     return { run: false, lastDailyRunDate: today };
   }
 
+  const dailyTime = normalizeDailyTime(settings.dailyTime) || DEFAULT_SETTINGS.dailyTime;
   const hhmm = pad(now.getHours()) + ':' + pad(now.getMinutes());
-  if (hhmm >= settings.dailyTime) {
-    return { run: true, lastDailyRunDate: today };
+  if (hhmm < dailyTime) return unchanged;
+
+  if (retry && retry.date === today) {
+    if (retry.failures > DAILY_MAX_RETRIES) return unchanged;
+    if (now.getTime() - retry.lastAttempt < DAILY_RETRY_DELAY_MS) return unchanged;
   }
 
-  return { run: false, lastDailyRunDate: settings.lastDailyRunDate };
+  return { run: true, lastDailyRunDate: settings.lastDailyRunDate };
 }
 
 /**
@@ -115,7 +229,8 @@ class BackupRun {
   constructor(opts) {
     this.sourceDir = opts.sourceDir;
     this.targetRoot = opts.targetRoot;
-    this.targetRootResolved = path.resolve(opts.targetRoot);
+    this.platform = opts.platform || process.platform;
+    this.targetRootId = null; // dev+inode, filled in by run() once the folder exists
     this.vaultName = opts.vaultName;
     this.exclude = new Set(opts.exclude || []);
     this.keepDaily = Number.isFinite(opts.keepDaily) ? opts.keepDaily : 7;
@@ -123,8 +238,25 @@ class BackupRun {
     this.keepMonthly = Number.isFinite(opts.keepMonthly) ? opts.keepMonthly : 6;
     this.logFilePath = opts.logFilePath;
     this.onProgress = opts.onProgress || (() => {});
+    this.stallTimeoutMs = opts.stallTimeoutMs || COPY_STALL_TIMEOUT_MS;
     this.stats = { dirs: 0, files: 0, bytes: 0, skipped: 0, errors: [] };
     this.totalFiles = 0;
+  }
+
+  /**
+   * Whether dir is the backup target folder, so a target inside the vault
+   * isn't copied into its own snapshots. Compared by path (ignoring case where
+   * the OS does) and, where available, by dev+inode, which also catches the
+   * same folder reached through a symlink, junction or differently-typed path.
+   */
+  async isTargetRoot(dir) {
+    if (isSamePath(dir, this.targetRoot, this.platform)) return true;
+    if (!this.targetRootId) return false;
+    return (await fileIdentity(dir)) === this.targetRootId;
+  }
+
+  copyFileOnce(src, dest) {
+    return copyFileWithStallTimeout(src, dest, this.stallTimeoutMs);
   }
 
   async countFiles(dir) {
@@ -139,9 +271,10 @@ class BackupRun {
     for (const entry of entries) {
       if (this.exclude.has(entry.name)) continue;
       const from = path.join(dir, entry.name);
-      if (path.resolve(from) === this.targetRootResolved) continue;
       if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) count += await this.countFiles(from);
+      if (entry.isDirectory()) {
+        if (!(await this.isTargetRoot(from))) count += await this.countFiles(from);
+      }
       else if (entry.isFile()) count++;
     }
     return count;
@@ -149,16 +282,16 @@ class BackupRun {
 
   async copyFileWithRetry(src, dest, size) {
     for (let attempt = 1; ; attempt++) {
-      // Copy to a per-attempt temp path and rename into place on success. withTimeout()
-      // can't actually cancel the underlying fsp.copyFile -- on timeout the write may still
-      // be in flight -- so copying straight to `dest` risks a retry's copyFile racing the
-      // timed-out one on the very same path and leaving a corrupted file. A unique temp
-      // path per attempt means a still-running timed-out copy can never collide with dest.
+      // Copy to a per-attempt temp path and rename into place on success, so a
+      // failed or stalled attempt never leaves a truncated file under the real
+      // name, and a stuck write from an abandoned attempt (the OS may not let
+      // go of it right away) can never collide with the next attempt's file.
       const tmpDest = dest + '.tmp-' + process.pid + '-' + Date.now() + '-' + attempt;
       try {
-        await withTimeout(fsp.copyFile(src, tmpDest), COPY_TIMEOUT_MS, src);
+        await this.copyFileOnce(src, tmpDest);
         try {
           const st = await fsp.stat(src);
+          await fsp.chmod(tmpDest, st.mode);
           await fsp.utimes(tmpDest, st.atime, st.mtime);
         } catch (e) { /* not critical */ }
         await fsp.rename(tmpDest, dest);
@@ -185,7 +318,14 @@ class BackupRun {
       return;
     }
 
-    await fsp.mkdir(destDir, { recursive: true });
+    // A folder the target can't hold (a name with ':' or '?' on an NTFS/exFAT/SMB
+    // target, say) costs just that folder, not the whole backup.
+    try {
+      await fsp.mkdir(destDir, { recursive: true });
+    } catch (err) {
+      this.stats.errors.push(srcDir + '  ->  ' + err.message);
+      return;
+    }
     this.stats.dirs++;
 
     for (const entry of entries) {
@@ -193,8 +333,6 @@ class BackupRun {
 
       const from = path.join(srcDir, entry.name);
       const to = path.join(destDir, entry.name);
-
-      if (path.resolve(from) === this.targetRootResolved) { this.stats.skipped++; continue; }
 
       if (entry.isSymbolicLink()) {
         try {
@@ -206,6 +344,7 @@ class BackupRun {
       }
 
       if (entry.isDirectory()) {
+        if (await this.isTargetRoot(from)) { this.stats.skipped++; continue; }
         await this.copyTree(from, to);
         continue;
       }
@@ -302,27 +441,37 @@ class BackupRun {
       throw new Error('The source vault folder was not found: ' + this.sourceDir);
     }
 
-    await fsp.mkdir(this.targetRoot, { recursive: true });
-
     const prefix = this.vaultName + '-';
     const target = path.join(this.targetRoot, prefix + stamp());
-
-    if (await pathExists(target)) {
-      throw new Error('The target folder already exists: ' + target);
-    }
-
-    this.totalFiles = await this.countFiles(this.sourceDir);
-    this.onProgress({ files: 0, total: this.totalFiles, bytes: 0 });
-
-    await this.copyTree(this.sourceDir, target);
+    let deleted;
 
     try {
-      await fsp.writeFile(path.join(target, COMPLETE_MARKER), new Date().toISOString(), 'utf8');
-    } catch (err) {
-      this.stats.errors.push(target + '  ->  could not write completion marker: ' + err.message);
-    }
+      await fsp.mkdir(this.targetRoot, { recursive: true });
+      this.targetRootId = await fileIdentity(this.targetRoot);
 
-    const deleted = await this.applyRetention(prefix);
+      if (await pathExists(target)) {
+        throw new Error('The target folder already exists: ' + target);
+      }
+
+      this.totalFiles = await this.countFiles(this.sourceDir);
+      this.onProgress({ files: 0, total: this.totalFiles, bytes: 0 });
+
+      await this.copyTree(this.sourceDir, target);
+
+      try {
+        await fsp.writeFile(path.join(target, COMPLETE_MARKER), new Date().toISOString(), 'utf8');
+      } catch (err) {
+        this.stats.errors.push(target + '  ->  could not write completion marker: ' + err.message);
+      }
+
+      deleted = await this.applyRetention(prefix);
+    } catch (err) {
+      // Keep the per-file errors collected so far, not just the fatal one.
+      this.stats.errors.push('Backup aborted: ' + err.message);
+      await this.writeErrorLog(target);
+      err.logged = true;
+      throw err;
+    }
     await this.writeErrorLog(target);
 
     return {
@@ -341,16 +490,23 @@ module.exports = {
   RETRIES,
   RETRY_WAIT_MS,
   COMPLETE_MARKER,
-  COPY_TIMEOUT_MS,
+  COPY_STALL_TIMEOUT_MS,
+  DAILY_RETRY_DELAY_MS,
+  DAILY_MAX_RETRIES,
   DEFAULT_SETTINGS,
   pad,
   stamp,
   humanSize,
   sleep,
-  withTimeout,
+  copyFileWithStallTimeout,
+  isSamePath,
+  targetLocation,
+  fileIdentity,
+  normalizeDailyTime,
   parseBackupDate,
   isoWeekKey,
   pathExists,
+  localDateKey,
   isSameLocalDay,
   dailyScheduleDecision,
   BackupRun,
