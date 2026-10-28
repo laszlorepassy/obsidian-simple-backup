@@ -202,7 +202,8 @@ class SimpleBackupPlugin extends Plugin {
             ? `Backup finished with errors (${result.errors.length}). See backup-errors.log`
             : `Backup finished: ${result.files} files, ${humanSize(result.bytes)}`
         );
-        setTimeout(() => notice.hide(), 4000);
+        // Stays up (created with duration 0) until the user clicks it away,
+        // so a backup that ran unattended can still be confirmed.
         this.activeNotice = null;
       }
     } catch (err) {
@@ -212,7 +213,6 @@ class SimpleBackupPlugin extends Plugin {
       if (this.activeNotice) {
         const notice = this.activeNotice;
         notice.setMessage('Backup error: ' + message);
-        setTimeout(() => notice.hide(), 8000);
         this.activeNotice = null;
       }
       try {

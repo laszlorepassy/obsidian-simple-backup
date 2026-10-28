@@ -101,7 +101,7 @@ async function fileExists(p) {
   try { await fsp.access(p); return true; } catch { return false; }
 }
 
-test('a folder the target cannot create costs only that folder, not the whole backup', async () => {
+test('a folder the target cannot create costs only that folder, not the whole backup', { skip: process.platform === 'win32' && "the fixture needs a '?' folder name, which Windows cannot create" }, async () => {
   const root = await mkTmpDir();
   const realMkdir = fsp.mkdir;
   try {

@@ -685,7 +685,6 @@ var SimpleBackupPlugin = class extends Plugin {
         notice.setMessage(
           result.errors.length ? `Backup finished with errors (${result.errors.length}). See backup-errors.log` : `Backup finished: ${result.files} files, ${humanSize(result.bytes)}`
         );
-        setTimeout(() => notice.hide(), 4e3);
         this.activeNotice = null;
       }
     } catch (err) {
@@ -695,7 +694,6 @@ var SimpleBackupPlugin = class extends Plugin {
       if (this.activeNotice) {
         const notice = this.activeNotice;
         notice.setMessage("Backup error: " + message);
-        setTimeout(() => notice.hide(), 8e3);
         this.activeNotice = null;
       }
       try {
