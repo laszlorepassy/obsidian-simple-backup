@@ -5,7 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const fsp = fs.promises;
 const {
-  DEFAULT_SETTINGS, humanSize, BackupRun, dailyScheduleDecision, localDateKey, normalizeDailyTime, targetLocation,
+  DEFAULT_SETTINGS, humanSize, summarizeErrors, BackupRun, dailyScheduleDecision, localDateKey, normalizeDailyTime, targetLocation,
 } = require('../backup-core');
 const { ScreenWakeLock } = require('./wake-lock');
 
@@ -199,7 +199,9 @@ class SimpleBackupPlugin extends Plugin {
         const notice = this.activeNotice;
         notice.setMessage(
           result.errors.length
-            ? `Backup finished with errors (${result.errors.length}). See backup-errors.log`
+            ? `Backup finished with ${result.errors.length} error(s):
+${summarizeErrors(result.errors)}
+Details: backup-errors.log`
             : `Backup finished: ${result.files} files, ${humanSize(result.bytes)}`
         );
         // Stays up (created with duration 0) until the user clicks it away,

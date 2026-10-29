@@ -270,6 +270,7 @@ class BackupRun {
     let count = 0;
     for (const entry of entries) {
       if (this.exclude.has(entry.name)) continue;
+      if (dir === this.sourceDir && entry.name === COMPLETE_MARKER) continue;
       const from = path.join(dir, entry.name);
       if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory()) {
@@ -330,6 +331,9 @@ class BackupRun {
 
     for (const entry of entries) {
       if (this.exclude.has(entry.name)) { this.stats.skipped++; continue; }
+      // A marker inside the source (left by a restored backup) must never be
+      // copied: it would be stale, and it can be unwritable on the target.
+      if (srcDir === this.sourceDir && entry.name === COMPLETE_MARKER) continue;
 
       const from = path.join(srcDir, entry.name);
       const to = path.join(destDir, entry.name);
@@ -423,6 +427,25 @@ class BackupRun {
     return deleted;
   }
 
+  // Writes the marker, replacing whatever is there (remove first: an existing
+  // read-only or locked file makes an in-place overwrite fail with EPERM), and
+  // retries, since cloud drives like pCloud can be briefly busy.
+  async writeCompleteMarker(target) {
+    const file = path.join(target, COMPLETE_MARKER);
+    let lastErr;
+    for (let attempt = 1; attempt <= RETRIES; attempt++) {
+      try {
+        try { await fsp.unlink(file); } catch (e) { /* not there: fine */ }
+        await fsp.writeFile(file, new Date().toISOString(), 'utf8');
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < RETRIES) await sleep(RETRY_WAIT_MS * attempt);
+      }
+    }
+    throw lastErr;
+  }
+
   async writeErrorLog(target) {
     if (!this.stats.errors.length) return;
     const lines = [];
@@ -459,7 +482,7 @@ class BackupRun {
       await this.copyTree(this.sourceDir, target);
 
       try {
-        await fsp.writeFile(path.join(target, COMPLETE_MARKER), new Date().toISOString(), 'utf8');
+        await this.writeCompleteMarker(target);
       } catch (err) {
         this.stats.errors.push(target + '  ->  could not write completion marker: ' + err.message);
       }
@@ -486,7 +509,20 @@ class BackupRun {
   }
 }
 
+// One readable line for the result notice: the count plus what actually went
+// wrong, so the user doesn't have to open the log to know whether to worry.
+function summarizeErrors(errors, maxShown = 2, maxLen = 160) {
+  const short = (e) => {
+    const t = String(e).replace(/\s+/g, ' ');
+    return t.length > maxLen ? t.slice(0, maxLen - 1) + '…' : t;
+  };
+  const shown = errors.slice(0, maxShown).map(short);
+  const more = errors.length - shown.length;
+  return shown.join('\n') + (more > 0 ? `\n(+${more} more)` : '');
+}
+
 module.exports = {
+  summarizeErrors,
   RETRIES,
   RETRY_WAIT_MS,
   COMPLETE_MARKER,

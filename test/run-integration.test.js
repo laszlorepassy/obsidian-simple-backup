@@ -180,3 +180,29 @@ test('a run that aborts still writes the errors it collected to the log', async 
     await rmDir(root);
   }
 });
+
+test('a stale completion marker in the vault is not copied and the fresh one is written', async () => {
+  const root = await mkTmpDir();
+  try {
+    const source = path.join(root, 'vault');
+    const target = path.join(root, 'target');
+    await makeFakeVault(source);
+    await fsp.writeFile(path.join(source, COMPLETE_MARKER), 'stale-marker', 'utf8');
+    const result = await new BackupRun({
+      sourceDir: source, targetRoot: target, vaultName: 'Vault', exclude: ['node_modules'],
+      logFilePath: path.join(root, 'backup-errors.log'),
+    }).run();
+    assert.equal(result.errors.length, 0);
+    const marker = await fsp.readFile(path.join(result.target, COMPLETE_MARKER), 'utf8');
+    assert.notEqual(marker, 'stale-marker');
+  } finally {
+    await rmDir(root);
+  }
+});
+
+test('summarizeErrors shows the first errors and counts the rest', () => {
+  const { summarizeErrors } = require('../backup-core');
+  const out = summarizeErrors(['a  ->  boom', 'b  ->  bang', 'c', 'd']);
+  assert.match(out, /boom/);
+  assert.match(out, /\(\+2 more\)/);
+});

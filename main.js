@@ -207,6 +207,7 @@ var require_backup_core = __commonJS({
         let count = 0;
         for (const entry of entries) {
           if (this.exclude.has(entry.name)) continue;
+          if (dir === this.sourceDir && entry.name === COMPLETE_MARKER) continue;
           const from = path2.join(dir, entry.name);
           if (entry.isSymbolicLink()) continue;
           if (entry.isDirectory()) {
@@ -263,6 +264,7 @@ var require_backup_core = __commonJS({
             this.stats.skipped++;
             continue;
           }
+          if (srcDir === this.sourceDir && entry.name === COMPLETE_MARKER) continue;
           const from = path2.join(srcDir, entry.name);
           const to = path2.join(destDir, entry.name);
           if (entry.isSymbolicLink()) {
@@ -338,6 +340,27 @@ var require_backup_core = __commonJS({
         }
         return deleted;
       }
+      // Writes the marker, replacing whatever is there (remove first: an existing
+      // read-only or locked file makes an in-place overwrite fail with EPERM), and
+      // retries, since cloud drives like pCloud can be briefly busy.
+      async writeCompleteMarker(target) {
+        const file = path2.join(target, COMPLETE_MARKER);
+        let lastErr;
+        for (let attempt = 1; attempt <= RETRIES; attempt++) {
+          try {
+            try {
+              await fsp2.unlink(file);
+            } catch (e) {
+            }
+            await fsp2.writeFile(file, (/* @__PURE__ */ new Date()).toISOString(), "utf8");
+            return;
+          } catch (err) {
+            lastErr = err;
+            if (attempt < RETRIES) await sleep(RETRY_WAIT_MS * attempt);
+          }
+        }
+        throw lastErr;
+      }
       async writeErrorLog(target) {
         if (!this.stats.errors.length) return;
         const lines = [];
@@ -368,7 +391,7 @@ var require_backup_core = __commonJS({
           this.onProgress({ files: 0, total: this.totalFiles, bytes: 0 });
           await this.copyTree(this.sourceDir, target);
           try {
-            await fsp2.writeFile(path2.join(target, COMPLETE_MARKER), (/* @__PURE__ */ new Date()).toISOString(), "utf8");
+            await this.writeCompleteMarker(target);
           } catch (err) {
             this.stats.errors.push(target + "  ->  could not write completion marker: " + err.message);
           }
@@ -391,7 +414,18 @@ var require_backup_core = __commonJS({
         };
       }
     };
+    function summarizeErrors2(errors, maxShown = 2, maxLen = 160) {
+      const short = (e) => {
+        const t = String(e).replace(/\s+/g, " ");
+        return t.length > maxLen ? t.slice(0, maxLen - 1) + "\u2026" : t;
+      };
+      const shown = errors.slice(0, maxShown).map(short);
+      const more = errors.length - shown.length;
+      return shown.join("\n") + (more > 0 ? `
+(+${more} more)` : "");
+    }
     module2.exports = {
+      summarizeErrors: summarizeErrors2,
       RETRIES,
       RETRY_WAIT_MS,
       COMPLETE_MARKER,
@@ -517,6 +551,7 @@ var fsp = fs.promises;
 var {
   DEFAULT_SETTINGS,
   humanSize,
+  summarizeErrors,
   BackupRun,
   dailyScheduleDecision,
   localDateKey,
@@ -683,7 +718,9 @@ var SimpleBackupPlugin = class extends Plugin {
       if (this.activeNotice) {
         const notice = this.activeNotice;
         notice.setMessage(
-          result.errors.length ? `Backup finished with errors (${result.errors.length}). See backup-errors.log` : `Backup finished: ${result.files} files, ${humanSize(result.bytes)}`
+          result.errors.length ? `Backup finished with ${result.errors.length} error(s):
+${summarizeErrors(result.errors)}
+Details: backup-errors.log` : `Backup finished: ${result.files} files, ${humanSize(result.bytes)}`
         );
         this.activeNotice = null;
       }
