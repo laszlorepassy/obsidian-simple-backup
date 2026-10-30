@@ -59,6 +59,13 @@ Most sync/backup plugins are built around cloud services, conflict resolution, o
 - **Folders or files the target can't hold** (e.g. names containing `:` or `?` when backing up from macOS/Linux to an NTFS, exFAT or SMB drive) are skipped and listed in `backup-errors.log`; the rest of the backup goes ahead.
 - **The "Browse…" folder picker** depends on Electron's `remote.dialog`, which isn't part of every Obsidian/Electron build. If it's unavailable, the button shows a notice and you can still type the path in by hand.
 
+## Disclosures
+
+- **File access outside the vault:** it reads the vault and writes the backup target folder you choose, and deletes old snapshots there according to the retention settings. It also writes `backup-errors.log` inside the plugin's own folder.
+- **Network and programs:** it makes no network requests, runs no external programs, and has no telemetry or account.
+- **Desktop only:** it uses Node.js's `fs` module, so it does not load on mobile.
+- **Release provenance:** release files are built by GitHub Actions from the tagged source and carry build-provenance attestations (`gh attestation verify main.js --repo laszlorepassy/obsidian-simple-backup`).
+
 ## Project layout
 
 - `src/main.js` — the plugin entry point: settings UI, scheduling, and the ribbon icon/command.

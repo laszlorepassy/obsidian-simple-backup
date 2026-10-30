@@ -113,7 +113,7 @@ if (mainDiff !== '') {
 const ahead = sh('git', ['rev-list', '--count', 'origin/main..HEAD']);
 
 if (dryRun) {
-  console.log(`\nDry run OK. Would push ${ahead} commit(s), tag ${version}, push the tag, and create a GitHub release.`);
+  console.log(`\nDry run OK. Would push ${ahead} commit(s), tag ${version}, push the tag, and let the release workflow publish it.`);
   process.exit(0);
 }
 
@@ -124,36 +124,39 @@ if (ahead !== '0') {
   console.log('origin/main already up to date');
 }
 
-step(`Tagging ${version}`);
-sh('git', ['tag', '-a', version, '-m', `Release ${version}`]);
-sh('git', ['push', 'origin', version], { stdio: 'inherit' });
-
-// --- 7. Create the GitHub release with the assets Obsidian needs -------
-
-step('Creating GitHub release');
-
 // Use the "Bump to X: ..." commit subject as release notes when one exists
 // for this version (it needn't be HEAD — other commits may have landed on
-// top of the bump before this release was cut); otherwise let gh generate
-// notes from the commit range.
+// top of the bump before this release was cut). The notes travel in the tag
+// message; the release workflow turns them into the GitHub release notes
+// (or generates notes when there are none).
 const bumpSubject = sh('git', [
   'log', '-1', '--format=%s',
   `--grep=^Bump to ${version.replace(/\./g, '\\.')}:`,
 ]);
 const bumpMatch = bumpSubject.match(new RegExp(`^Bump to ${version.replace(/\./g, '\\.')}:\\s*(.+)$`));
+const tagMessage = bumpMatch ? `Release ${version}\n\n${bumpMatch[1]}` : `Release ${version}`;
 
-const assets = ['manifest.json', 'main.js'];
-if (fs.existsSync(path.join(root, 'styles.css'))) {
-  assets.push('styles.css');
+step(`Tagging ${version}`);
+sh('git', ['tag', '-a', version, '-m', tagMessage]);
+sh('git', ['push', 'origin', version], { stdio: 'inherit' });
+
+// --- 7. The release workflow builds, attests and publishes -------------
+
+// Releases are created by .github/workflows/release.yml, so that the assets are
+// built on GitHub and carry build-provenance attestations.
+step('Waiting for the release workflow (.github/workflows/release.yml)');
+let runId = '';
+for (let i = 0; i < 20 && !runId; i++) {
+  runId = sh('gh', ['run', 'list', '--workflow', 'release.yml', '--branch', version, '--limit', '1', '--json', 'databaseId', '--jq', '.[0].databaseId // empty']);
+  if (!runId) execFileSync(process.execPath, ['-e', 'setTimeout(()=>{}, 3000)']);
 }
-
-const ghArgs = ['release', 'create', version, ...assets, '--title', version];
-if (bumpMatch) {
-  ghArgs.push('--notes', bumpMatch[1]);
-} else {
-  ghArgs.push('--generate-notes');
+if (!runId) {
+  fail(`tag ${version} was pushed, but no release workflow run appeared; check the Actions tab`);
 }
-
-sh('gh', ghArgs, { stdio: 'inherit' });
+try {
+  sh('gh', ['run', 'watch', runId, '--exit-status'], { stdio: 'inherit' });
+} catch (err) {
+  fail(`the release workflow failed (tag ${version} is already pushed); see: gh run view ${runId} --log-failed`);
+}
 
 console.log(`\nDone. Released ${version}.`);
